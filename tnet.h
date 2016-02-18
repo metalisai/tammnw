@@ -44,7 +44,7 @@ enum ConnectionState
     CEConnected
 };
 
-#define RECEIVED_MESSAGE_HISTORY_SIZE   1024 // POWER OF 2 ONLY
+#define RECEIVED_MESSAGE_HISTORY_SIZE   4096 // POWER OF 2 ONLY
 
 enum RingQueueState
 {
@@ -147,6 +147,9 @@ struct SentReliableData
     QueuedData qData;
 };
 
+#define REL_HEADER_SIZE 18
+#define UREL_HEADER_SIZE 2
+
 #pragma pack(push,1)
 struct urelbody
 {
@@ -194,7 +197,7 @@ void sendData(Host* host, i32 connection, const char* data, const i32 dataSize, 
 void sendPendingData(Host* host);
 
 
-#ifdef TNET_IMPLEMENTATION
+//#ifdef TNET_IMPLEMENTATION
 
 // RINGBUFFER
 
@@ -278,12 +281,13 @@ i32 sendToSocket(i32 socket, void* data, u16 size, u32 destIp, u16 destPort)
     address.sin_port = htons((unsigned short)destPort);
 
     i32 sentBytes = 1;
-    if(random() % 3 != 1 || pl == false)
+    // uncomment for 33% packetloss
+    //if(random() % 3 != 1/* || pl == false*/)
         sentBytes = sendto(socket, data, size, 0, (sockaddr*)&address, sizeof(sockaddr_in));
-    else
+    /*else
     {
         //printf("dropped a packet :) \n");
-    }
+    }*/
 
     if(sentBytes <= 0)
     {
@@ -385,6 +389,7 @@ void proccessRemoteAck(connectionState& connection, u32 ack, u32 ackBits)
 {
     unsigned int cabits;
 
+    // REMCONST
     for (int i = 0; i < 32; i++) // TODO: dumb solution like this cant be the best way?
     {
         cabits = ackBits;
@@ -405,14 +410,12 @@ void proccessRemoteAck(connectionState& connection, u32 ack, u32 ackBits)
 }
 
 // only used by receiveProc
-void ackPacket(connectionState& connection, u32 remSeq, u16 messageId)
+void ackPacket(connectionState& connection, u32 remSeq)
 {
-    connection.receivedMessages[messageId%RECEIVED_MESSAGE_HISTORY_SIZE] = messageId;
-
-    if (remSeq > connection.ack) // newer packet
+    if (remSeq >= connection.ack) // newer packet
     {
         unsigned int difference = remSeq - connection.ack;
-        if (difference < 32)
+        if (difference < 32) // REMCONST
         {
             connection.ackBits <<= difference;
             connection.ackBits |= 1;
@@ -435,11 +438,6 @@ void ackPacket(connectionState& connection, u32 remSeq, u16 messageId)
 // TODO: accept strings
 i32 hostConnect(Host* host, u32 destIp, u16 destPort)
 {
-    /*packet p;
-    p.acceptCon = false;
-    p.reqCon = true;
-    p.size = 2; // 2 = unreliable packet header size
-    p.hasRel = false;*/
     i32 conId = findAndResetInactiveConnectionSlot(host->conStates, host->maxConnections);
     if(conId >= 0)
     {
@@ -448,7 +446,7 @@ i32 hostConnect(Host* host, u32 destIp, u16 destPort)
         host->conStates[conId].destPort = destPort;
         host->conStates[conId].state = ConnectionState::CEConnecting;
         pthread_mutex_unlock(&host->conStates[conId].conMutex);
-        sendData(host, conId, (char*)0, 0, false, SEND_DATA_FLAG_REQCON);
+        sendData(host, conId, (char*)0, 0, true, SEND_DATA_FLAG_REQCON);
     }
     else
     {
@@ -460,28 +458,18 @@ i32 hostConnect(Host* host, u32 destIp, u16 destPort)
 // TODO: accept strings
 i32 hostAccept(Host* host, i32 conId)
 {
-    /*packet p;
-    p.acceptCon = false;
-    p.reqCon = true;
-    p.size = 2; // 2 = unreliable packet header size
-    p.hasRel = false;*/
     if(conId >= 0)
     {
         pthread_mutex_lock(&host->conStates[conId].conMutex);
         host->conStates[conId].state = ConnectionState::CEConnected;
         pthread_mutex_unlock(&host->conStates[conId].conMutex);
-        sendData(host, conId, (char*)0, 0, false, SEND_DATA_FLAG_ACCCON);
+        sendData(host, conId, (char*)0, 0, true, SEND_DATA_FLAG_ACCCON);
     }
     else
     {
         printf("Tried to accept invalid connection!\n");
     }
     return conId;
-}
-
-void hostAcceptConnection(Host* host, i32 conId)
-{
-    sendData(host, conId, 0, 0, true, SEND_DATA_FLAG_ACCCON);
 }
 
 void QDataToPacket(QueuedData& q, packet& p, u32 ack, u32 ackBits, u32 seqId, u16 messageId)
@@ -493,7 +481,8 @@ void QDataToPacket(QueuedData& q, packet& p, u32 ack, u32 ackBits, u32 seqId, u1
 
     if(q.reliable)
     {
-        p.size = q.size + 16; // 16 = reliable packet header size
+        // REMCONST
+        p.size = q.size + REL_HEADER_SIZE; // 16 = reliable packet header size
 
         p.relBody.ack = ack;
         p.relBody.ackBits = ackBits;
@@ -505,7 +494,7 @@ void QDataToPacket(QueuedData& q, packet& p, u32 ack, u32 ackBits, u32 seqId, u1
     }
     else
     {
-        p.size = q.size + 2; // 2 = unreiliable packet header size
+        p.size = q.size + UREL_HEADER_SIZE; // 2 = unreiliable packet header size
         memcpy(p.urelBody.data, q.data, q.size);
     }
 }
@@ -525,7 +514,7 @@ void sendPacket(Host* host, packet& p, QueuedData& q, u16 messageId)
         rdata.messageId = messageId;
 
         memcpy(&rdata.qData,&q,sizeof(QueuedData)-MAX_PACKET_SIZE+q.size);
-        bool qd = RingQueueQueueData(&host->resendBuffer, &rdata, sizeof(rdata)-MAX_PACKET_SIZE+q.size);
+        bool qd = RingQueueQueueData(&host->resendBuffer, &rdata, sizeof(SentReliableData)-MAX_PACKET_SIZE+q.size);
         assert(qd);
     }
 
@@ -558,23 +547,24 @@ void sendPackets(Host* host)
     net_time_point now;
     clock_gettime(CLOCK_MONOTONIC, &now);
     // dif in msec
-    double dif = (now.tv_sec-rdata.sendTime.tv_sec)*1000+(now.tv_nsec-rdata.sendTime.tv_nsec)/1000000;
-    while(got && dif >= 10.0)
+    double dif = (now.tv_sec-rdata.sendTime.tv_sec)*1000+(now.tv_nsec-rdata.sendTime.tv_nsec)/1000000; // REMCONST
+    while(got && dif >= 200.0) // REMCONST
     {
         bool isReceived = host->conStates[rdata.qData.connection].confirmedPackets[rdata.pId%CONFIRMED_PACKETS_HISTORY_SIZE] == rdata.pId;
         if(!isReceived)
         {
             //printf("Message resent\n");
+
             sendPacket(host, p, rdata.qData, rdata.messageId);
         }
         RingQueueDequeue(&host->resendBuffer);
         got = RingQueuePeekData(&host->resendBuffer, &rdata, sizeof(rdata));
         if (got)
-            dif = (now.tv_sec-rdata.sendTime.tv_sec)*1000+(now.tv_nsec-rdata.sendTime.tv_nsec)/1000000;
+            dif = (now.tv_sec-rdata.sendTime.tv_sec)*1000+(now.tv_nsec-rdata.sendTime.tv_nsec)/1000000; // REMCONST
     }
 }
 
-void receivePacket(u32 connectionId, connectionState& connection, packet& p, i32 received, RingQueue* recBuf)
+void receivePacket(u32 connectionId, connectionState& connection, packet& p, i32 received, RingQueue* recBuf, HostEvent event)
 {
     i32 size = p.size;
 
@@ -586,7 +576,7 @@ void receivePacket(u32 connectionId, connectionState& connection, packet& p, i32
 
     if(p.hasRel)
     {
-        if(p.relBody.size != received - 16)
+        if(p.relBody.size != received - REL_HEADER_SIZE) // REMCONST
         {
             printf("Corrupted packet 2\n");
             return;
@@ -596,10 +586,17 @@ void receivePacket(u32 connectionId, connectionState& connection, packet& p, i32
 
         u16 messageId = p.relBody.messageId;
         bool received = connection.receivedMessages[messageId%RECEIVED_MESSAGE_HISTORY_SIZE] == messageId;
+        if(!received)
+        {
+            // TODO: replace assert with a useful measure (dc?)
+            i32 cur = connection.receivedMessages[messageId%RECEIVED_MESSAGE_HISTORY_SIZE];
+            assert(cur == 0xFFFF || cur == (messageId-RECEIVED_MESSAGE_HISTORY_SIZE)); // if this fails, it means that either a reliable data was dropped or receivedMessages array overflowed
+            connection.receivedMessages[messageId%RECEIVED_MESSAGE_HISTORY_SIZE] = messageId;
+        }
         // confirm what the remote party has received
         proccessRemoteAck(connection, p.relBody.ack, p.relBody.ackBits);
         // acknowledge the packet we received
-        ackPacket(connection, p.relBody.seqId, messageId);
+        ackPacket(connection, p.relBody.seqId);
 
         pthread_mutex_unlock(&connection.conMutex);  // <------------ CONNECTION MUTEX UNLOCK
 
@@ -609,7 +606,7 @@ void receivePacket(u32 connectionId, connectionState& connection, packet& p, i32
             ReceivedEvent buf;
             buf.connection = connectionId;
             buf.size = p.relBody.size;
-            buf.type = HostEvent::HEData;
+            buf.type = event;
             memcpy(buf.data, p.relBody.data, p.relBody.size);
             bool qd = RingQueueQueueData(recBuf, &buf, sizeof(buf)-MAX_PACKET_SIZE+p.relBody.size);
             assert(qd);
@@ -620,8 +617,8 @@ void receivePacket(u32 connectionId, connectionState& connection, packet& p, i32
     {
         ReceivedEvent buf;
         buf.connection = connectionId;
-        buf.size = p.size-2; // 2 is the size of main header TODO:if you ever change header size
-        buf.type = HostEvent::HEData;
+        buf.size = p.size-UREL_HEADER_SIZE; // 2 is the size of main header TODO:if you ever change header size
+        buf.type = event;
         memcpy(buf.data, p.urelBody.data, buf.size);
         bool qd = RingQueueQueueData(recBuf, &buf, sizeof(buf)-MAX_PACKET_SIZE+buf.size);
         assert(qd);
@@ -644,7 +641,7 @@ void* receiveProc(void* context)
     RingQueue* receiveBuf = &args->host->receiveBuffer;
     Host* host = args->host;
 
-    free(args);
+    free(context);
 
     packet buf;
     i32 received;
@@ -664,7 +661,11 @@ void* receiveProc(void* context)
             if(cstate == ConnectionState::CEConnected)
             {
                 pthread_mutex_lock(&host->receiveBufMutex);
-                receivePacket(conId, connections[conId],buf, received, receiveBuf);
+                /*if(received == REL_HEADER_SIZE+4)
+                {
+                    assert(false);
+                }*/
+                receivePacket(conId, connections[conId],buf, received, receiveBuf, HostEvent::HEData);
                 pthread_mutex_unlock(&host->receiveBufMutex);
             }
             else if(cstate == ConnectionState::CEConnecting && buf.acceptCon)
@@ -672,16 +673,9 @@ void* receiveProc(void* context)
                 pthread_mutex_lock(&connections[conId].conMutex);
                 connections[conId].state = ConnectionState::CEConnected;
                 pthread_mutex_unlock(&connections[conId].conMutex);
-                ReceivedEvent event;
-                event.type = HostEvent::HEConnect;
-                event.connection = conId;
-                // TODO: deal with overflow
-                u32 size = buf.hasRel?buf.relBody.size:buf.size-2;
-                event.size = size;
-                memcpy(event.data, buf.hasRel?buf.relBody.data:buf.urelBody.data,size); // 2 = unreliable header size
+
                 pthread_mutex_lock(&host->receiveBufMutex);
-                bool qd = RingQueueQueueData(receiveBuf, &event, sizeof(event)-MAX_PACKET_SIZE+size);
-                assert(qd);
+                receivePacket(conId, connections[conId],buf, received, receiveBuf, HostEvent::HEConnect);
                 pthread_mutex_unlock(&host->receiveBufMutex);
             }
         }
@@ -694,22 +688,11 @@ void* receiveProc(void* context)
                 connections[newConId].state = ConnectionState::CEConnecting;
                 connections[newConId].destIP = fromAddr;
                 connections[newConId].destPort = fromPort;
-                //receivePacket(conId, connections[newConId], buf, received, receiveBuf);
                 pthread_mutex_unlock(&connections[newConId].conMutex);
 
-
-                ReceivedEvent event;
-                event.type = HostEvent::HEConnect;
-                event.connection = newConId;
-                // TODO: deal with overflow
-                u32 size = buf.hasRel?buf.relBody.size:buf.size-2;
-                event.size = size;
-                memcpy(event.data, buf.hasRel?buf.relBody.data:buf.urelBody.data,size); // 2 = unreliable header size
                 pthread_mutex_lock(&host->receiveBufMutex);
-                bool qd = RingQueueQueueData(receiveBuf, &event, sizeof(event)-MAX_PACKET_SIZE+size);
-                assert(qd);
+                receivePacket(newConId, connections[newConId],buf, received, receiveBuf, HostEvent::HEConnect);
                 pthread_mutex_unlock(&host->receiveBufMutex);
-
             }
             else
             {
@@ -737,7 +720,7 @@ void* sendProc(void* context)
 
     sendProcArgs* args = (sendProcArgs*)context;
     Host* host = args->host;
-    free(args);
+    free(context);
 
     pthread_mutex_lock (&host->sendMut);
 
@@ -1052,7 +1035,7 @@ bool RingQueueDequeue(RingQueue* dq)
     return cursize > 0;
 }
 
-#endif // TNET_IMPLEMENTATION
+//#endif // TNET_IMPLEMENTATION
 
 #endif // TNET_H
 
