@@ -25,10 +25,7 @@ typedef uint64_t u64;
 typedef uint32_t u32;
 typedef uint16_t u16;
 
-#define Kilobytes(Value) ((Value)*1024LL)
-#define Megabytes(Value) (Kilobytes(Value)*1024LL)
-#define Gigabytes(Value) (Megabytes(Value)*1024LL)
-#define Terabytes(Value) (Gigabytes(Value)*1024LL)
+#define Megabytes(Value) (Value*1024LL*1024LL)
 
 #define SEND_DATA_FLAG_REQCON 1
 #define SEND_DATA_FLAG_ACCCON 2
@@ -48,37 +45,35 @@ enum ConnectionState
 
 enum RingQueueState
 {
-        Empty,
-        None,
-        Full
+    Empty,
+    None,
+    Full
 };
 
 struct RingQueue
 {
-        char* startAddr = NULL;
-        size_t size = 0;
-        char* dequeuePointer = NULL;
-        char* queuePointer = NULL;
-        RingQueueState state = RingQueueState::Empty;
+    char* startAddr = NULL;
+    size_t size = 0;
+    char* dequeuePointer = NULL;
+    char* queuePointer = NULL;
+    RingQueueState state = RingQueueState::Empty;
 };
+
+typedef timespec net_time_point;
 
 struct connectionState
 {
     i32 socket;
     u32 destIP;
     u16 destPort;
-
     i32 seqId;
     u32 ack;
     i32 ackBits;
-
     u16 messageId;
-
     ConnectionState state;
-
+    net_time_point lastPacketReceived;
     u32 confirmedPackets[CONFIRMED_PACKETS_HISTORY_SIZE];
     u16 receivedMessages[RECEIVED_MESSAGE_HISTORY_SIZE];
-
     pthread_mutex_t conMutex;
 };
 
@@ -87,24 +82,19 @@ struct Host
     u32 maxConnections;
     i32 socket;
     connectionState* conStates;
-
     // resend buffer (doesn't need mutex, accessed only from 1 thread)
     // holds SentMessages structs
     RingQueue resendBuffer;
-
     // receive buffer
     // holds ReceivedMessage structs
     pthread_mutex_t receiveBufMutex;
     RingQueue receiveBuffer;
-
     // send buffer
     // holds QueuedMessage structs
     RingQueue sendBuffer;
     pthread_mutex_t sendBufMutex;
-
     pthread_t recWorker;
     pthread_t sendWorker;
-
     volatile bool sendDone;
     pthread_mutex_t sendMut;
     pthread_cond_t sendCon;
@@ -118,7 +108,6 @@ enum HostEvent
     HEDisconnect,
     HEData
 };
-
 
 struct ReceivedEvent
 {
@@ -137,7 +126,6 @@ struct QueuedData
     char data[MAX_PACKET_SIZE];
 };
 
-typedef timespec net_time_point;
 
 struct SentReliableData
 {
@@ -181,14 +169,6 @@ struct packet
 };
 #pragma pack(pop)
 
-void hello();
-
-
-/*i32 openSocket(u16 port);
-void closeSocket(i32 socket);
-bool recvFromSocket(i32 socket, char* data, i32& received, i32& fromAddr, u16& fromPort);
-i32 sendToSocket(i32 socket, char* data, u16 size, u32 destIp, u16 destPort);*/
-
 // actual API
 void CreateHost(Host* host, u16 port, i32 maxConnections);
 void FreeHost(Host* host);
@@ -196,11 +176,9 @@ HostEvent getNextEvent(i32 connection, char* buf, int& received);
 void sendData(Host* host, i32 connection, const char* data, const i32 dataSize, const bool reliable, u32 flags = 0);
 void sendPendingData(Host* host);
 
-
 //#ifdef TNET_IMPLEMENTATION
 
 // RINGBUFFER
-
 bool RingQueueInitialize(RingQueue* dq, size_t size);
 void RingQueueFreeMemory(RingQueue* dq);
 void RingQueueReset(RingQueue* dq);
@@ -210,15 +188,7 @@ size_t RingQueueDequeueData(RingQueue* dq, void* data, unsigned int size);
 size_t RingQueuePeekData(RingQueue* dq, void* data, unsigned int size);
 RingQueueState RingQueueGetState(RingQueue* dq);
 bool RingQueueDequeue(RingQueue* dq);
-
 // RINGBUFFER END
-
-i32 packetSize(packet& packet)
-{
-    i32 size = packet.size/*+2*/;
-    /*size += packet.hasRel ? 14 : 0;*/
-    return size;
-}
 
 void closeSocket(i32 socket)
 {
@@ -241,19 +211,16 @@ i32 openSocket(u16 port)
         printf("Creating socket failed!\n");
         return -1;
     }
-
     // bind
     sockaddr_in address;
     address.sin_family = AF_INET;
     address.sin_addr.s_addr = INADDR_ANY;
     address.sin_port = htons((unsigned short)port);
-
     if(bind(nsock, (const sockaddr*)&address, sizeof(sockaddr_in)) < 0)
     {
         printf("Binding socket failed!\n");
         return -1;
     }
-
     // set blocking mode
     u32 blocking = 1;
     u32 flags = fcntl(nsock, F_GETFL, 0);
@@ -267,7 +234,6 @@ i32 openSocket(u16 port)
         closeSocket(nsock);
         return -1;
     }
-
     return nsock;
 }
 
@@ -279,16 +245,10 @@ i32 sendToSocket(i32 socket, void* data, u16 size, u32 destIp, u16 destPort)
     address.sin_family = AF_INET;
     address.sin_addr.s_addr = htonl(destIp);
     address.sin_port = htons((unsigned short)destPort);
-
     i32 sentBytes = 1;
     // uncomment for 33% packetloss
     //if(random() % 3 != 1/* || pl == false*/)
         sentBytes = sendto(socket, data, size, 0, (sockaddr*)&address, sizeof(sockaddr_in));
-    /*else
-    {
-        //printf("dropped a packet :) \n");
-    }*/
-
     if(sentBytes <= 0)
     {
         printf("sendToSocket failed!\n");
@@ -299,21 +259,16 @@ i32 sendToSocket(i32 socket, void* data, u16 size, u32 destIp, u16 destPort)
 bool recvFromSocket(i32 socket, char* data, i32& received, u32& fromAddr, u16& fromPort)
 {
     bool ret;
-
     sockaddr_in from;
     socklen_t fromLength = sizeof(from);
-
     i32 ss;
     //TODO: replace max packet size
     ss = recvfrom(socket, (char*)data, MAX_PACKET_SIZE, 0, (sockaddr*)&from, &fromLength);
-
     if(ss == -1)
     {
         printf("recvfrom failed errno:%d\n",errno);
     }
-
     ret = ss > 0;
-
     if (ret)
     {
         received = (i32)ss;
@@ -321,7 +276,6 @@ bool recvFromSocket(i32 socket, char* data, i32& received, u32& fromAddr, u16& f
         fromPort = ntohs(from.sin_port);
         return true;
     }
-
     return false;
 }
 
@@ -337,12 +291,11 @@ void initConnectionState(connectionState& state)
     // TODO: could save few cycles here
     state.conMutex = PTHREAD_MUTEX_INITIALIZER;
     state.messageId = 0;
-
+    clock_gettime(CLOCK_MONOTONIC, &state.lastPacketReceived);
     for(int i=0; i< CONFIRMED_PACKETS_HISTORY_SIZE;i++)
     {
         state.confirmedPackets[i] = 0xFFFFFFFF;
     }
-
     for(int i=0; i< RECEIVED_MESSAGE_HISTORY_SIZE;i++)
     {
         state.receivedMessages[i] = 0xFFFF;
@@ -388,16 +341,13 @@ i32 findActiveConnectionByDest(connectionState* connections, int maxConnections,
 void proccessRemoteAck(connectionState& connection, u32 ack, u32 ackBits)
 {
     unsigned int cabits;
-
     // REMCONST
     for (int i = 0; i < 32; i++) // TODO: dumb solution like this cant be the best way?
     {
         cabits = ackBits;
-
         cabits >>= i; // shift the interested bit into bit 0
         cabits &= 1; // mask so that only bit 0 remains
         assert(cabits == 1 || cabits == 0);
-
         u32 remPacketId = ack - i; // the remoteSequenceId the packet represents
         if (cabits == 1)
         {
@@ -478,17 +428,14 @@ void QDataToPacket(QueuedData& q, packet& p, u32 ack, u32 ackBits, u32 seqId, u1
     p.reqCon = (q.flags & SEND_DATA_FLAG_REQCON) != 0;
     p.acceptCon = (q.flags & SEND_DATA_FLAG_ACCCON) != 0;
     p.reserved = 0;
-
     if(q.reliable)
     {
         // REMCONST
         p.size = q.size + REL_HEADER_SIZE; // 16 = reliable packet header size
-
         p.relBody.ack = ack;
         p.relBody.ackBits = ackBits;
         p.relBody.seqId = seqId;
         p.relBody.messageId = messageId;
-
         p.relBody.size = q.size;
         memcpy(p.relBody.data, q.data, q.size);
     }
@@ -502,9 +449,11 @@ void QDataToPacket(QueuedData& q, packet& p, u32 ack, u32 ackBits, u32 seqId, u1
 // connection mutex must be locked !!
 void sendPacket(Host* host, packet& p, QueuedData& q, u16 messageId)
 {
-    SentReliableData rdata;
     connectionState* connections = host->conStates;
+    if(connections[q.connection].state == ConnectionState::CEDisconnected)
+        return;
 
+    SentReliableData rdata;
     QDataToPacket(q, p, connections[q.connection].ack, connections[q.connection].ackBits, connections[q.connection].seqId++, messageId);
 
     if(q.reliable)
@@ -522,13 +471,56 @@ void sendPacket(Host* host, packet& p, QueuedData& q, u16 messageId)
     sendToSocket(host->socket, &p, p.size, connections[q.connection].destIP, connections[q.connection].destPort);
 }
 
+i32 getDurationToNowMs(net_time_point pastPoint)
+{
+    net_time_point now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    double dif = (now.tv_sec-pastPoint.tv_sec)*1000+(now.tv_nsec-pastPoint.tv_nsec)/1000000;
+    return (i32)dif;
+}
+
+#define CONNECTION_TIMEOUT_MS   10000
+
+// lock mutex!
+void disconnectConnection(Host* host, u32 connectionId)
+{
+    // TODO: send a disconnect message to the other side too
+    host->conStates[connectionId].state = ConnectionState::CEDisconnected;
+    pthread_mutex_lock(&host->receiveBufMutex);
+    ReceivedEvent buf;
+    buf.connection = connectionId;
+    buf.size = 0;
+    buf.type = HostEvent::HEDisconnect;
+    bool qd = RingQueueQueueData(&host->receiveBuffer, &buf, sizeof(buf)-MAX_PACKET_SIZE+buf.size);
+    assert(qd);
+    pthread_mutex_unlock(&host->receiveBufMutex);
+}
+
+void checkConnectionStates(Host* host)
+{
+    connectionState* connections = host->conStates;
+    for(u32 i = 0; i < host->maxConnections; i++)
+    {
+        pthread_mutex_lock(&connections[i].conMutex);
+        if(connections[i].state != ConnectionState::CEDisconnected)
+        {
+            if(getDurationToNowMs(connections[i].lastPacketReceived) > CONNECTION_TIMEOUT_MS)
+            {
+                disconnectConnection(host, i);
+                printf("Disconnected\n");
+            }
+        }
+        pthread_mutex_unlock(&connections[i].conMutex);
+    }
+}
+
+
 void sendPackets(Host* host)
 {
     QueuedData q;
     packet p;
 
     connectionState* connections = host->conStates;
-
     pthread_mutex_lock(&host->sendBufMutex);
     // TODO: what happens if buf too small?
     // TODO: can invalid connectionid get here?
@@ -539,16 +531,12 @@ void sendPackets(Host* host)
         pthread_mutex_unlock(&connections[q.connection].conMutex);
     }
     pthread_mutex_unlock(&host->sendBufMutex);
-
-
     // check if everything needs resend
     SentReliableData rdata;
     bool got = RingQueuePeekData(&host->resendBuffer, &rdata, sizeof(rdata));
-    net_time_point now;
-    clock_gettime(CLOCK_MONOTONIC, &now);
     // dif in msec
-    double dif = (now.tv_sec-rdata.sendTime.tv_sec)*1000+(now.tv_nsec-rdata.sendTime.tv_nsec)/1000000; // REMCONST
-    while(got && dif >= 200.0) // REMCONST
+    i32 dif = getDurationToNowMs(rdata.sendTime); // REMCONST
+    while(got && dif >= 200) // REMCONST
     {
         bool isReceived = host->conStates[rdata.qData.connection].confirmedPackets[rdata.pId%CONFIRMED_PACKETS_HISTORY_SIZE] == rdata.pId;
         if(!isReceived)
@@ -560,20 +548,18 @@ void sendPackets(Host* host)
         RingQueueDequeue(&host->resendBuffer);
         got = RingQueuePeekData(&host->resendBuffer, &rdata, sizeof(rdata));
         if (got)
-            dif = (now.tv_sec-rdata.sendTime.tv_sec)*1000+(now.tv_nsec-rdata.sendTime.tv_nsec)/1000000; // REMCONST
+            dif = getDurationToNowMs(rdata.sendTime); // REMCONST
     }
 }
 
 void receivePacket(u32 connectionId, connectionState& connection, packet& p, i32 received, RingQueue* recBuf, HostEvent event)
 {
     i32 size = p.size;
-
     if(size != received) // packet size didn't match, corrupted or incomplete
     {
         printf("Corrupted packet 1\n");
         return;
     }
-
     if(p.hasRel)
     {
         if(p.relBody.size != received - REL_HEADER_SIZE) // REMCONST
@@ -581,25 +567,22 @@ void receivePacket(u32 connectionId, connectionState& connection, packet& p, i32
             printf("Corrupted packet 2\n");
             return;
         }
-
         pthread_mutex_lock(&connection.conMutex); // <------------ CONNECTION MUTEX LOCK
-
+        clock_gettime(CLOCK_MONOTONIC, &connection.lastPacketReceived);
         u16 messageId = p.relBody.messageId;
         bool received = connection.receivedMessages[messageId%RECEIVED_MESSAGE_HISTORY_SIZE] == messageId;
         if(!received)
         {
             // TODO: replace assert with a useful measure (dc?)
             i32 cur = connection.receivedMessages[messageId%RECEIVED_MESSAGE_HISTORY_SIZE];
-            assert(cur == 0xFFFF || cur == (messageId-RECEIVED_MESSAGE_HISTORY_SIZE)); // if this fails, it means that either a reliable data was dropped or receivedMessages array overflowed
+           // assert(cur == 0xFFFF || cur == (messageId-RECEIVED_MESSAGE_HISTORY_SIZE)); // if this fails, it means that either a reliable data was dropped or receivedMessages array overflowed
             connection.receivedMessages[messageId%RECEIVED_MESSAGE_HISTORY_SIZE] = messageId;
         }
         // confirm what the remote party has received
         proccessRemoteAck(connection, p.relBody.ack, p.relBody.ackBits);
         // acknowledge the packet we received
         ackPacket(connection, p.relBody.seqId);
-
         pthread_mutex_unlock(&connection.conMutex);  // <------------ CONNECTION MUTEX UNLOCK
-
         if(!received) // only receive if not received before
         {
             // TODO: check buffer overflow?
@@ -634,15 +617,12 @@ struct receiveProcArgs
 void* receiveProc(void* context)
 {
     receiveProcArgs* args = (receiveProcArgs*)context;
-
     i32 socket = args->host->socket;
     connectionState* connections = args->host->conStates;
     u32 maxConnections = args->host->maxConnections;
     RingQueue* receiveBuf = &args->host->receiveBuffer;
     Host* host = args->host;
-
     free(context);
-
     packet buf;
     i32 received;
     u32 fromAddr;
@@ -661,10 +641,6 @@ void* receiveProc(void* context)
             if(cstate == ConnectionState::CEConnected)
             {
                 pthread_mutex_lock(&host->receiveBufMutex);
-                /*if(received == REL_HEADER_SIZE+4)
-                {
-                    assert(false);
-                }*/
                 receivePacket(conId, connections[conId],buf, received, receiveBuf, HostEvent::HEData);
                 pthread_mutex_unlock(&host->receiveBufMutex);
             }
@@ -704,7 +680,6 @@ void* receiveProc(void* context)
             printf("weird packet? \n");
         }
     }
-
     printf("Receive worker closed!\n");
     return 0;
 }
@@ -717,25 +692,21 @@ struct sendProcArgs
 void* sendProc(void* context)
 {
     printf("Send worker started!\n");
-
     sendProcArgs* args = (sendProcArgs*)context;
     Host* host = args->host;
     free(context);
-
     pthread_mutex_lock (&host->sendMut);
-
     while(true)                      //if while loop with signal complete first don't wait
     {
         while(host->sendDone)
         {
             pthread_cond_wait(&host->sendCon, &host->sendMut);
         }
+        checkConnectionStates(host);
         sendPackets(host);
         host->sendDone = true;
     }
-
     pthread_mutex_unlock (&host->sendMut);
-
     printf("Send worker closed!\n");
     return 0;
 }
@@ -744,30 +715,24 @@ void CreateHost(Host* host, u16 port, i32 maxConnections)
 {
     host->maxConnections = maxConnections;
     //host->
-
     host->socket = openSocket(port);
     if(host->socket < 0)
         return;
-
     host->conStates = (connectionState*)malloc(maxConnections*sizeof(connectionState));
     for(int i=0; i<maxConnections;i++)
     {
         initConnectionState(host->conStates[i]);
         host->conStates[i].socket = host->socket;
     }
-
     // TODO: scale buffer size based on max connections?
     RingQueueInitialize(&host->resendBuffer, Megabytes(10));
     RingQueueInitialize(&host->sendBuffer, Megabytes(1));
     RingQueueInitialize(&host->receiveBuffer, Megabytes(1));
-
     host->sendDone = true;
     host->sendMut=PTHREAD_MUTEX_INITIALIZER;
     host->sendCon=PTHREAD_COND_INITIALIZER;
-
     host->sendBufMutex=PTHREAD_MUTEX_INITIALIZER;
     host->receiveBufMutex=PTHREAD_MUTEX_INITIALIZER;
-
     receiveProcArgs* wargs = new receiveProcArgs;
     wargs->host = host;
     if(pthread_create(&host->recWorker, 0, receiveProc, wargs))
@@ -777,7 +742,6 @@ void CreateHost(Host* host, u16 port, i32 maxConnections)
         // TODO: return false?
         return;
     }
-
     sendProcArgs* swargs = new sendProcArgs;
     swargs->host = host;
     if(pthread_create(&host->sendWorker, 0, sendProc, swargs))
@@ -829,11 +793,9 @@ void sendPendingData(Host* host)
     pthread_mutex_lock (&host->sendMut);
     /*if(!host->sendDone)
         printf("main thread next iteration, but send thread not even started!\n");*/
-
     host->sendDone = false;
     //printf("signaling send worker\n");
     pthread_cond_signal(&host->sendCon);
-
     pthread_mutex_unlock (&host->sendMut);
     //pthread_yield(); // just in case
 }
@@ -890,12 +852,9 @@ bool RingQueueQueueData(RingQueue* dq, const void* data, size_t size)
 {
     if (size <= 0)
         return false;
-
     char* endaddr = dq->startAddr + dq->size;
     char* pointer = dq->queuePointer;
-
     char* next = (pointer + sizeof(size_t) + size);
-
     if (next >= endaddr) // back to start if not enough room
     {
         if (pointer + sizeof(size_t) <= endaddr)
@@ -909,19 +868,16 @@ bool RingQueueQueueData(RingQueue* dq, const void* data, size_t size)
             return false;
         }
     }
-
     if ((pointer < dq->dequeuePointer && next >= dq->dequeuePointer) /*|| // buffer overflow would happen                                                                                                                             (pointer >= dq->dequeuePointer && next <= dq->dequeuePointer)*/)
     {
         dq->state = RingQueueState::Full;
         return false;
     }
-
     *(size_t*)pointer = size;
     pointer += sizeof(size_t);
     memcpy(pointer, data, size);
     pointer += size;
     dq->queuePointer = pointer;
-
     if (dq->state == RingQueueState::Empty)
     {
         dq->state = RingQueueState::None;
@@ -1009,7 +965,7 @@ bool RingQueueDequeue(RingQueue* dq)
 {
     if (dq->state == RingQueueState::Empty) // if its empty then its empty...
     {
-            return 0;
+        return 0;
     }
     char* pointer = dq->dequeuePointer;
     size_t cursize;
@@ -1034,10 +990,5 @@ bool RingQueueDequeue(RingQueue* dq)
     dq->state = RingQueueState::Empty;
     return cursize > 0;
 }
-
 //#endif // TNET_IMPLEMENTATION
-
 #endif // TNET_H
-
-
-

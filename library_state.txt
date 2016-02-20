@@ -2,7 +2,6 @@ TODO:
 	Sequenced reliable packets
 	Option to drop unordered unreliable packets
 	Ping/RTT measuring
-	Connection timeounts
 	Optional automatic buffer resize in case of overflow
 	Data limits (some protection against flooding)
 	Getting rid of unneccesary memcpys / better memory layout
@@ -16,6 +15,7 @@ DONE:
 	Optional reliability for data
 	Sparate thread(s)
 	Simple 2-way handshake for connecting
+	Connection timeounts
 
 DON'T KNOW IF I WANT:
 	File transmisson
