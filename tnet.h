@@ -4,6 +4,8 @@
 #include <stdlib.h>
 #include <stdio.h>
 
+#define TNET_PLATFORM_LINUX
+
 //linux
 #include <sys/socket.h>
 #include <netinet/in.h>
@@ -12,86 +14,97 @@
 #include <string.h>
 #include <pthread.h>
 #include <errno.h>
+#include <unistd.h>
 //TODO: remove
 #include <assert.h>
 
 #include <cstdint>
 
-typedef int64_t i64;
-typedef int32_t i32;
-typedef int16_t i16;
+typedef int64_t tnet_i64;
+typedef int32_t tnet_i32;
+typedef int16_t tnet_i16;
 
-typedef uint64_t u64;
-typedef uint32_t u32;
-typedef uint16_t u16;
+typedef uint64_t tnet_u64;
+typedef uint32_t tnet_u32;
+typedef uint16_t tnet_u16;
 
-#define Megabytes(Value) (Value*1024LL*1024LL)
+#define tnet_Megabytes(Value) (Value*1024LL*1024LL)
 
-#define SEND_DATA_FLAG_REQCON 1
-#define SEND_DATA_FLAG_ACCCON 2
-//#define SEND_DATA_FLAG_REQCON 4
+#define TNET_SEND_DATA_FLAG_REQCON       1
+#define TNET_SEND_DATA_FLAG_ACCCON       1<<1
+#define TNET_SEND_DATA_FLAG_HEARTBEAT    1<<2
+#define TNET_SEND_DATA_FLAG_DECLINE      1<<3
 
-#define MAX_PACKET_SIZE 512
-#define CONFIRMED_PACKETS_HISTORY_SIZE  512
+#define TNET_MAX_PACKET_SIZE 512
+#define TNET_CONFIRMED_PACKETS_HISTORY_SIZE  512
 
-enum ConnectionState
+#define TNET_CONNECTION_TIMEOUT_MS   10000
+
+enum tnet_connection_state_t
 {
     CEDisconnected,
     CEConnecting,
     CEConnected
 };
 
-#define RECEIVED_MESSAGE_HISTORY_SIZE   4096 // POWER OF 2 ONLY
+#define TNET_RECEIVED_MESSAGE_HISTORY_SIZE   4096 // POWER OF 2 ONLY
 
-enum RingQueueState
+enum tnet_ringqueue_state_t
 {
     Empty,
     None,
     Full
 };
 
-struct RingQueue
+struct tnet_ringqueue
 {
     char* startAddr = NULL;
     size_t size = 0;
     char* dequeuePointer = NULL;
     char* queuePointer = NULL;
-    RingQueueState state = RingQueueState::Empty;
+    tnet_ringqueue_state_t state = tnet_ringqueue_state_t::Empty;
 };
 
-typedef timespec net_time_point;
+#ifdef TNET_PLATFORM_LINUX
+typedef timespec tnet_time_point;
+#else
+    #error tnet_time_point not defined on this platform!
+#endif
 
-struct connectionState
+struct tnet_connection_state
 {
-    i32 socket;
-    u32 destIP;
-    u16 destPort;
-    i32 seqId;
-    u32 ack;
-    i32 ackBits;
-    u16 messageId;
-    ConnectionState state;
-    net_time_point lastPacketReceived;
-    u32 confirmedPackets[CONFIRMED_PACKETS_HISTORY_SIZE];
-    u16 receivedMessages[RECEIVED_MESSAGE_HISTORY_SIZE];
+    tnet_i32 socket;
+    tnet_u32 destIP;
+    tnet_i32 seqId;
+    tnet_u32 ack;
+    tnet_i32 ackBits;
+    tnet_u16 destPort;
+    tnet_u16 messageId;
+    tnet_u32 packetsSinceAck;
+    tnet_connection_state_t state;
+    tnet_time_point lastPacketReceived;
+    tnet_time_point lastPacketSent;
+    tnet_u32 confirmedPackets[TNET_CONFIRMED_PACKETS_HISTORY_SIZE];
+    tnet_u16 receivedMessages[TNET_RECEIVED_MESSAGE_HISTORY_SIZE];
     pthread_mutex_t conMutex;
 };
 
-struct Host
+struct tnet_host
 {
-    u32 maxConnections;
-    i32 socket;
-    connectionState* conStates;
+    tnet_u32 maxConnections;
+    tnet_i32 socket;
+    bool keepConnectionsAlive;
+    tnet_connection_state* conStates;
     // resend buffer (doesn't need mutex, accessed only from 1 thread)
     // holds SentMessages structs
-    RingQueue resendBuffer;
+    tnet_ringqueue resendBuffer;
     // receive buffer
     // holds ReceivedMessage structs
     pthread_mutex_t receiveBufMutex;
-    RingQueue receiveBuffer;
+    tnet_ringqueue receiveBuffer;
     // send buffer
     // holds QueuedMessage structs
-    RingQueue sendBuffer;
+    tnet_ringqueue sendBuffer;
     pthread_mutex_t sendBufMutex;
     pthread_t recWorker;
     pthread_t sendWorker;
@@ -101,7 +114,7 @@ struct Host
 
 };
 
-enum HostEvent
+enum tnet_host_event_t
 {
     HENothing,
     HEConnect,
@@ -109,92 +122,123 @@ enum HostEvent
     HEData
 };
 
-struct ReceivedEvent
-{
-    HostEvent type;
-    i32 connection;
-    u32 size;
-    char data[MAX_PACKET_SIZE];
-};
+// actual API
+bool tnet_create_host(tnet_host* host, tnet_u16 port, tnet_i32 maxConnections);
+void tnet_free_host(tnet_host* host);
+tnet_host_event_t tnet_get_next_event(tnet_i32 connection, char* buf, int& received);
+void tnet_queue_data(tnet_host* host, tnet_i32 connection, const char* data, const tnet_i32 dataSize, const bool reliable, tnet_u32 flags = 0);
+void tnet_release_pending_data(tnet_host* host);
+void tnet_disconnect(tnet_host* host, tnet_u32 connectionId);
+tnet_i32 tnet_accept(tnet_host* host, tnet_i32 conId);
 
-struct QueuedData
+#ifdef TNET_IMPLEMENTATION
+
+struct tnet_received_event
+{
+    tnet_host_event_t type;
+    tnet_i32 connection;
+    tnet_u32 size;
+    char data[TNET_MAX_PACKET_SIZE];
+};
+struct tnet_queued_data
 {
     bool reliable;
-    i32 connection;
-    i32 size;
-    u32 flags;
-    char data[MAX_PACKET_SIZE];
+    tnet_i32 connection;
+    tnet_i32 size;
+    tnet_u32 flags;
+    char data[TNET_MAX_PACKET_SIZE];
 };
-
-
-struct SentReliableData
+struct tnet_sent_reliable_data
 {
-    net_time_point sendTime;
-    u32 pId;
-    u16 messageId;
-    QueuedData qData;
+    tnet_time_point sendTime;
+    tnet_u32 pId;
+    tnet_u16 messageId;
+    tnet_queued_data qData;
 };
 
 #define REL_HEADER_SIZE 18
 #define UREL_HEADER_SIZE 2
 
 #pragma pack(push,1)
-struct urelbody
+struct tnet_urelbody
 {
-    unsigned char data[MAX_PACKET_SIZE];
+    unsigned char data[TNET_MAX_PACKET_SIZE];
 };
 
-struct relbody
+struct tnet_relbody
 {
-    i32 seqId; // 4
-    i32 ack;   // 8
-    i32 ackBits; // 12
-    u16 size; // 14
-    u16 messageId; // 16
-    unsigned char data[MAX_PACKET_SIZE];
+    tnet_i32 seqId; // 4
+    tnet_i32 ack;   // 8
+    tnet_i32 ackBits; // 12
+    tnet_u16 size; // 14
+    tnet_u16 messageId; // 16
+    unsigned char data[TNET_MAX_PACKET_SIZE];
 };
 
-struct packet
+struct tnet_packet
 {
     unsigned char hasRel : 1;
     unsigned char reqCon : 1;
     unsigned char acceptCon : 1;
-    unsigned char reserved : 3;
-    u16 size : 10;
+    unsigned char heartbeat : 1;
+    unsigned char decline : 1;
+    unsigned char reserved : 1;
+    tnet_u16 size : 10;
     union
     {
-        urelbody urelBody;
-        relbody relBody;
+        tnet_urelbody urelBody;
+        tnet_relbody relBody;
     };
 };
 #pragma pack(pop)
 
-// actual API
-void CreateHost(Host* host, u16 port, i32 maxConnections);
-void FreeHost(Host* host);
-HostEvent getNextEvent(i32 connection, char* buf, int& received);
-void sendData(Host* host, i32 connection, const char* data, const i32 dataSize, const bool reliable, u32 flags = 0);
-void sendPendingData(Host* host);
+// RINGQUEUE
+bool tnet_ringqueue_initialize(tnet_ringqueue* dq, size_t size);
+void tnet_ring_queue_free(tnet_ringqueue* dq);
+void tnet_ringqueue_reset(tnet_ringqueue* dq);
+bool tnet_ringqueue_queue(tnet_ringqueue* dq, const void* data, size_t size);
+size_t tnet_ringqueue_dequeue(tnet_ringqueue* dq, void* data, unsigned int size);
+size_t tnet_ringqueue_peek(tnet_ringqueue* dq, void* data, unsigned int size);
+//tnet_ringqueue_state_t RingQueueGetState(tnet_ringqueue* dq);
+bool tnet_ringqueue_drop(tnet_ringqueue* dq);
 
-//#ifdef TNET_IMPLEMENTATION
+inline void net_get_time(tnet_time_point& to)
+{
+#ifdef TNET_PLATFORM_LINUX
+    clock_gettime(CLOCK_MONOTONIC, &to);
+#else
+#error "net_get_time not defined on this platform"
+#endif
+}
 
-// RINGBUFFER
-bool RingQueueInitialize(RingQueue* dq, size_t size);
-void RingQueueFreeMemory(RingQueue* dq);
-void RingQueueReset(RingQueue* dq);
-void RingQueueZeroMemory(RingQueue* dq);
-bool RingQueueQueueData(RingQueue* dq, const void* data, size_t size);
-size_t RingQueueDequeueData(RingQueue* dq, void* data, unsigned int size);
-size_t RingQueuePeekData(RingQueue* dq, void* data, unsigned int size);
-RingQueueState RingQueueGetState(RingQueue* dq);
-bool RingQueueDequeue(RingQueue* dq);
-// RINGBUFFER END
+inline tnet_i32 getDurationToNowMs(tnet_time_point pastPoint)
+{
+#ifdef TNET_PLATFORM_LINUX
+    tnet_time_point now;
+    net_get_time(now);
+    double dif = (now.tv_sec-pastPoint.tv_sec)*1000+(now.tv_nsec-pastPoint.tv_nsec)/1000000;
+    return (tnet_i32)dif;
+#else
+#error getDurationToNowMs not defined
+#endif
+}
 
-void closeSocket(i32 socket)
+inline tnet_i32 getDurationMs(tnet_time_point from, tnet_time_point to)
+{
+#ifdef TNET_PLATFORM_LINUX
+    double dif = (to.tv_sec-from.tv_sec)*1000+(to.tv_nsec-from.tv_nsec)/1000000;
+    return (tnet_i32)dif;
+#else
+    #error getDuration not defined
+#endif
+}
+
+void closeSocket(tnet_i32 socket)
 {
     if(socket != -1)
     {
-        shutdown(socket, SHUT_RDWR);
+        close(socket);
+        //shutdown(socket, SHUT_RDWR);
     }
     else
     {
@@ -202,10 +246,10 @@ void closeSocket(i32 socket)
     }
 }
 
-i32 openSocket(u16 port)
+tnet_i32 openSocket(tnet_u16 port)
 {
     //create socket
-    i32 nsock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    tnet_i32 nsock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
     if(nsock < 0)
     {
         printf("Creating socket failed!\n");
@@ -222,8 +266,8 @@ i32 openSocket(u16 port)
         return -1;
     }
     // set blocking mode
-    u32 blocking = 1;
-    u32 flags = fcntl(nsock, F_GETFL, 0);
+    tnet_u32 blocking = 1;
+    tnet_u32 flags = fcntl(nsock, F_GETFL, 0);
     if (blocking)
         flags &= ~O_NONBLOCK;
     else
@@ -237,17 +281,15 @@ i32 openSocket(u16 port)
     return nsock;
 }
 
-bool pl = false;
-
-i32 sendToSocket(i32 socket, void* data, u16 size, u32 destIp, u16 destPort)
+tnet_i32 sendToSocket(tnet_i32 socket, void* data, tnet_u16 size, tnet_u32 destIp, tnet_u16 destPort)
 {
     sockaddr_in address;
     address.sin_family = AF_INET;
     address.sin_addr.s_addr = htonl(destIp);
     address.sin_port = htons((unsigned short)destPort);
-    i32 sentBytes = 1;
+    tnet_i32 sentBytes = 1;
     // uncomment for 33% packetloss
-    //if(random() % 3 != 1/* || pl == false*/)
+    //if(random() % 3 != 1)
         sentBytes = sendto(socket, data, size, 0, (sockaddr*)&address, sizeof(sockaddr_in));
     if(sentBytes <= 0)
     {
@@ -256,14 +298,13 @@ i32 sendToSocket(i32 socket, void* data, u16 size, u32 destIp, u16 destPort)
     return sentBytes;
 }
 
-bool recvFromSocket(i32 socket, char* data, i32& received, u32& fromAddr, u16& fromPort)
+bool recvFromSocket(tnet_i32 socket, char* data, tnet_i32& received, tnet_u32& fromAddr, tnet_u16& fromPort)
 {
     bool ret;
     sockaddr_in from;
     socklen_t fromLength = sizeof(from);
-    i32 ss;
-    //TODO: replace max packet size
-    ss = recvfrom(socket, (char*)data, MAX_PACKET_SIZE, 0, (sockaddr*)&from, &fromLength);
+    tnet_i32 ss;
+    ss = recvfrom(socket, (char*)data, TNET_MAX_PACKET_SIZE, 0, (sockaddr*)&from, &fromLength);
     if(ss == -1)
     {
         printf("recvfrom failed errno:%d\n",errno);
@@ -271,7 +312,7 @@ bool recvFromSocket(i32 socket, char* data, i32& received, u32& fromAddr, u16& f
     ret = ss > 0;
     if (ret)
     {
-        received = (i32)ss;
+        received = (tnet_i32)ss;
         fromAddr = ntohl(from.sin_addr.s_addr);
         fromPort = ntohs(from.sin_port);
         return true;
@@ -279,7 +320,7 @@ bool recvFromSocket(i32 socket, char* data, i32& received, u32& fromAddr, u16& f
     return false;
 }
 
-void initConnectionState(connectionState& state)
+void initConnectionState(tnet_connection_state& state)
 {
     state.ack = 0;
     state.ackBits = 0;
@@ -287,28 +328,29 @@ void initConnectionState(connectionState& state)
     state.destIP = 0;
     state.destPort = 0;
     state.socket = -1;
-    state.state = ConnectionState::CEDisconnected;
-    // TODO: could save few cycles here
+    state.state = tnet_connection_state_t::CEDisconnected;
+    // TODO: make platform independent!
     state.conMutex = PTHREAD_MUTEX_INITIALIZER;
     state.messageId = 0;
-    clock_gettime(CLOCK_MONOTONIC, &state.lastPacketReceived);
-    for(int i=0; i< CONFIRMED_PACKETS_HISTORY_SIZE;i++)
+    state.packetsSinceAck = 0;
+    net_get_time(state.lastPacketReceived);
+    for(int i=0; i< TNET_CONFIRMED_PACKETS_HISTORY_SIZE;i++)
     {
         state.confirmedPackets[i] = 0xFFFFFFFF;
     }
-    for(int i=0; i< RECEIVED_MESSAGE_HISTORY_SIZE;i++)
+    for(int i=0; i< TNET_RECEIVED_MESSAGE_HISTORY_SIZE;i++)
     {
         state.receivedMessages[i] = 0xFFFF;
     }
 }
 
-i32 findAndResetInactiveConnectionSlot(connectionState* connections, int maxConnections)
+tnet_i32 findAndResetInactiveConnectionSlot(tnet_connection_state* connections, int maxConnections)
 {
-    i32 ret = -1;
+    tnet_i32 ret = -1;
     for(int i = 0; i < maxConnections; i++)
     {
         pthread_mutex_lock(&connections[i].conMutex);
-        if(connections[i].state == ConnectionState::CEDisconnected)
+        if(connections[i].state == tnet_connection_state_t::CEDisconnected)
         {
             initConnectionState(connections[i]);
             ret = i;
@@ -320,13 +362,14 @@ i32 findAndResetInactiveConnectionSlot(connectionState* connections, int maxConn
     return ret;
 }
 
-i32 findActiveConnectionByDest(connectionState* connections, int maxConnections, u32 ip, u16 port)
+tnet_i32 findActiveConnectionByDest(tnet_connection_state* connections, int maxConnections, tnet_u32 ip, tnet_u16 port)
 {
-    i32 ret = -1;
+	// TODO: hastable, binary search or something?
+    tnet_i32 ret = -1;
     for(int i = 0; i < maxConnections; i++)
     {
         pthread_mutex_lock(&connections[i].conMutex);
-        if(connections[i].state != ConnectionState::CEDisconnected && connections[i].destIP == ip && connections[i].destPort == port)
+        if(connections[i].state != tnet_connection_state_t::CEDisconnected && connections[i].destIP == ip && connections[i].destPort == port)
         {
             ret = i;
         }
@@ -338,7 +381,7 @@ i32 findActiveConnectionByDest(connectionState* connections, int maxConnections,
 }
 
 // only used by receiveProc
-void proccessRemoteAck(connectionState& connection, u32 ack, u32 ackBits)
+void proccessRemoteAck(tnet_connection_state& connection, tnet_u32 ack, tnet_u32 ackBits)
 {
     unsigned int cabits;
     // REMCONST
@@ -348,19 +391,19 @@ void proccessRemoteAck(connectionState& connection, u32 ack, u32 ackBits)
         cabits >>= i; // shift the interested bit into bit 0
         cabits &= 1; // mask so that only bit 0 remains
         assert(cabits == 1 || cabits == 0);
-        u32 remPacketId = ack - i; // the remoteSequenceId the packet represents
+        tnet_u32 remPacketId = ack - i; // the remoteSequenceId the packet represents
         if (cabits == 1)
         {
-            if (connection.confirmedPackets[remPacketId%CONFIRMED_PACKETS_HISTORY_SIZE] == remPacketId) // already confirmed
+            if (connection.confirmedPackets[remPacketId%TNET_CONFIRMED_PACKETS_HISTORY_SIZE] == remPacketId) // already confirmed
                 continue;
-            connection.confirmedPackets[remPacketId%CONFIRMED_PACKETS_HISTORY_SIZE] = remPacketId;
+            connection.confirmedPackets[remPacketId%TNET_CONFIRMED_PACKETS_HISTORY_SIZE] = remPacketId;
             //connection.confirmedPacketCount++; // do we even use this anywhere??
         }
     }
 }
 
 // only used by receiveProc
-void ackPacket(connectionState& connection, u32 remSeq)
+void ackPacket(tnet_connection_state& connection, tnet_u32 remSeq)
 {
     if (remSeq >= connection.ack) // newer packet
     {
@@ -386,17 +429,17 @@ void ackPacket(connectionState& connection, u32 remSeq)
 }
 
 // TODO: accept strings
-i32 hostConnect(Host* host, u32 destIp, u16 destPort)
+tnet_i32 hostConnect(tnet_host* host, tnet_u32 destIp, tnet_u16 destPort)
 {
-    i32 conId = findAndResetInactiveConnectionSlot(host->conStates, host->maxConnections);
+    tnet_i32 conId = findAndResetInactiveConnectionSlot(host->conStates, host->maxConnections);
     if(conId >= 0)
     {
         pthread_mutex_lock(&host->conStates[conId].conMutex);
         host->conStates[conId].destIP = destIp;
         host->conStates[conId].destPort = destPort;
-        host->conStates[conId].state = ConnectionState::CEConnecting;
+        host->conStates[conId].state = tnet_connection_state_t::CEConnecting;
         pthread_mutex_unlock(&host->conStates[conId].conMutex);
-        sendData(host, conId, (char*)0, 0, true, SEND_DATA_FLAG_REQCON);
+        tnet_queue_data(host, conId, (char*)0, 0, true, TNET_SEND_DATA_FLAG_REQCON);
     }
     else
     {
@@ -405,15 +448,14 @@ i32 hostConnect(Host* host, u32 destIp, u16 destPort)
     return conId;
 }
 
-// TODO: accept strings
-i32 hostAccept(Host* host, i32 conId)
+tnet_i32 tnet_accept(tnet_host* host, tnet_i32 conId)
 {
     if(conId >= 0)
     {
         pthread_mutex_lock(&host->conStates[conId].conMutex);
-        host->conStates[conId].state = ConnectionState::CEConnected;
+        host->conStates[conId].state = tnet_connection_state_t::CEConnected;
         pthread_mutex_unlock(&host->conStates[conId].conMutex);
-        sendData(host, conId, (char*)0, 0, true, SEND_DATA_FLAG_ACCCON);
+        tnet_queue_data(host, conId, (char*)0, 0, true, TNET_SEND_DATA_FLAG_ACCCON);
     }
     else
     {
@@ -422,11 +464,13 @@ i32 hostAccept(Host* host, i32 conId)
     return conId;
 }
 
-void QDataToPacket(QueuedData& q, packet& p, u32 ack, u32 ackBits, u32 seqId, u16 messageId)
+void QDataToPacket(tnet_queued_data& q, tnet_packet& p, tnet_u32 ack, tnet_u32 ackBits, tnet_u32 seqId, tnet_u16 messageId)
 {
     p.hasRel = q.reliable;
-    p.reqCon = (q.flags & SEND_DATA_FLAG_REQCON) != 0;
-    p.acceptCon = (q.flags & SEND_DATA_FLAG_ACCCON) != 0;
+    p.reqCon = (q.flags & TNET_SEND_DATA_FLAG_REQCON) != 0;
+    p.acceptCon = (q.flags & TNET_SEND_DATA_FLAG_ACCCON) != 0;
+    p.heartbeat = (q.flags & TNET_SEND_DATA_FLAG_HEARTBEAT) != 0;
+    p.decline = (q.flags & TNET_SEND_DATA_FLAG_DECLINE) != 0;
     p.reserved = 0;
     if(q.reliable)
     {
@@ -446,24 +490,32 @@ void QDataToPacket(QueuedData& q, packet& p, u32 ack, u32 ackBits, u32 seqId, u1
     }
 }
 
-// connection mutex must be locked !!
-void sendPacket(Host* host, packet& p, QueuedData& q, u16 messageId)
+inline bool flagSet(tnet_u32 flags, tnet_u32 flag)
 {
-    connectionState* connections = host->conStates;
-    if(connections[q.connection].state == ConnectionState::CEDisconnected)
+    return (flags & flag) != 0;
+}
+
+// connection mutex must be locked !!
+void sendPacket(tnet_host* host, tnet_packet& p, tnet_queued_data& q, tnet_u16 messageId, const tnet_time_point& now)
+{
+    tnet_connection_state* connections = host->conStates;
+    if(connections[q.connection].state == tnet_connection_state_t::CEDisconnected &&    // if disconnected and not notifying the disconnect
+            !flagSet(q.flags,TNET_SEND_DATA_FLAG_DECLINE))
         return;
 
-    SentReliableData rdata;
+    connections[q.connection].lastPacketSent = now;
+    tnet_sent_reliable_data rdata;
     QDataToPacket(q, p, connections[q.connection].ack, connections[q.connection].ackBits, connections[q.connection].seqId++, messageId);
 
     if(q.reliable)
     {
-        clock_gettime(CLOCK_MONOTONIC, &rdata.sendTime);
+        net_get_time(rdata.sendTime);
         rdata.pId = p.relBody.seqId;
         rdata.messageId = messageId;
+        connections[q.connection].packetsSinceAck = 0;
 
-        memcpy(&rdata.qData,&q,sizeof(QueuedData)-MAX_PACKET_SIZE+q.size);
-        bool qd = RingQueueQueueData(&host->resendBuffer, &rdata, sizeof(SentReliableData)-MAX_PACKET_SIZE+q.size);
+        memcpy(&rdata.qData,&q,sizeof(tnet_queued_data)-TNET_MAX_PACKET_SIZE+q.size);
+        bool qd = tnet_ringqueue_queue(&host->resendBuffer, &rdata, sizeof(tnet_sent_reliable_data)-TNET_MAX_PACKET_SIZE+q.size);
         assert(qd);
     }
 
@@ -471,40 +523,42 @@ void sendPacket(Host* host, packet& p, QueuedData& q, u16 messageId)
     sendToSocket(host->socket, &p, p.size, connections[q.connection].destIP, connections[q.connection].destPort);
 }
 
-i32 getDurationToNowMs(net_time_point pastPoint)
+// lock connection mutex!
+void disconnectConnection(tnet_host* host, tnet_u32 connectionId)  // internal version
 {
-    net_time_point now;
-    clock_gettime(CLOCK_MONOTONIC, &now);
-    double dif = (now.tv_sec-pastPoint.tv_sec)*1000+(now.tv_nsec-pastPoint.tv_nsec)/1000000;
-    return (i32)dif;
+    // TODO: send a disconnect message to the other side too, so it doesn't have to wait for timeout
+    if(host->conStates[connectionId].state != CEDisconnected)
+    {
+        host->conStates[connectionId].state = CEDisconnected;
+        pthread_mutex_lock(&host->receiveBufMutex);
+        tnet_received_event buf;
+        buf.connection = connectionId;
+        buf.size = 0;
+        buf.type = tnet_host_event_t::HEDisconnect;
+        bool qd = tnet_ringqueue_queue(&host->receiveBuffer, &buf, sizeof(buf)-TNET_MAX_PACKET_SIZE+buf.size);
+        assert(qd);
+        pthread_mutex_unlock(&host->receiveBufMutex);
+
+        tnet_queue_data(host, connectionId, 0, 0, false, TNET_SEND_DATA_FLAG_DECLINE);
+    }
 }
 
-#define CONNECTION_TIMEOUT_MS   10000
-
-// lock mutex!
-void disconnectConnection(Host* host, u32 connectionId)
+void tnet_disconnect(tnet_host* host, tnet_u32 connectionId) // API version
 {
-    // TODO: send a disconnect message to the other side too
-    host->conStates[connectionId].state = ConnectionState::CEDisconnected;
-    pthread_mutex_lock(&host->receiveBufMutex);
-    ReceivedEvent buf;
-    buf.connection = connectionId;
-    buf.size = 0;
-    buf.type = HostEvent::HEDisconnect;
-    bool qd = RingQueueQueueData(&host->receiveBuffer, &buf, sizeof(buf)-MAX_PACKET_SIZE+buf.size);
-    assert(qd);
-    pthread_mutex_unlock(&host->receiveBufMutex);
+    pthread_mutex_lock(&host->conStates[connectionId].conMutex);
+    disconnectConnection(host, connectionId);
+    pthread_mutex_unlock(&host->conStates[connectionId].conMutex);
 }
 
-void checkConnectionStates(Host* host)
+void checkConnectionStates(tnet_host* host)
 {
-    connectionState* connections = host->conStates;
-    for(u32 i = 0; i < host->maxConnections; i++)
+    tnet_connection_state* connections = host->conStates;
+    for(tnet_u32 i = 0; i < host->maxConnections; i++)
     {
         pthread_mutex_lock(&connections[i].conMutex);
-        if(connections[i].state != ConnectionState::CEDisconnected)
+        if(connections[i].state != tnet_connection_state_t::CEDisconnected)
         {
-            if(getDurationToNowMs(connections[i].lastPacketReceived) > CONNECTION_TIMEOUT_MS)
+            if(getDurationToNowMs(connections[i].lastPacketReceived) > TNET_CONNECTION_TIMEOUT_MS)
             {
                 disconnectConnection(host, i);
                 printf("Disconnected\n");
@@ -515,46 +569,61 @@ void checkConnectionStates(Host* host)
 }
 
 
-void sendPackets(Host* host)
+void sendPackets(tnet_host* host)
 {
-    QueuedData q;
-    packet p;
+    tnet_queued_data q;
+    tnet_packet p;
 
-    connectionState* connections = host->conStates;
+    tnet_connection_state* connections = host->conStates;
     pthread_mutex_lock(&host->sendBufMutex);
     // TODO: what happens if buf too small?
     // TODO: can invalid connectionid get here?
-    while(RingQueueDequeueData(&host->sendBuffer, &q, sizeof(q)) > 0)
+    tnet_time_point now;
+    net_get_time(now);
+    while(tnet_ringqueue_dequeue(&host->sendBuffer, &q, sizeof(q)) > 0)
     {
         pthread_mutex_lock(&connections[q.connection].conMutex);
-        sendPacket(host, p, q, connections[q.connection].messageId++);
+        sendPacket(host, p, q, connections[q.connection].messageId++, now);
         pthread_mutex_unlock(&connections[q.connection].conMutex);
     }
     pthread_mutex_unlock(&host->sendBufMutex);
     // check if everything needs resend
-    SentReliableData rdata;
-    bool got = RingQueuePeekData(&host->resendBuffer, &rdata, sizeof(rdata));
+    tnet_sent_reliable_data rdata;
+    bool got = tnet_ringqueue_peek(&host->resendBuffer, &rdata, sizeof(rdata));
     // dif in msec
-    i32 dif = getDurationToNowMs(rdata.sendTime); // REMCONST
+    tnet_i32 dif = getDurationToNowMs(rdata.sendTime); // REMCONST
     while(got && dif >= 200) // REMCONST
     {
-        bool isReceived = host->conStates[rdata.qData.connection].confirmedPackets[rdata.pId%CONFIRMED_PACKETS_HISTORY_SIZE] == rdata.pId;
+        bool isReceived = host->conStates[rdata.qData.connection].confirmedPackets[rdata.pId%TNET_CONFIRMED_PACKETS_HISTORY_SIZE] == rdata.pId;
         if(!isReceived)
         {
             //printf("Message resent\n");
 
-            sendPacket(host, p, rdata.qData, rdata.messageId);
+            sendPacket(host, p, rdata.qData, rdata.messageId, now);
         }
-        RingQueueDequeue(&host->resendBuffer);
-        got = RingQueuePeekData(&host->resendBuffer, &rdata, sizeof(rdata));
+        tnet_ringqueue_drop(&host->resendBuffer);
+        got = tnet_ringqueue_peek(&host->resendBuffer, &rdata, sizeof(rdata));
         if (got)
             dif = getDurationToNowMs(rdata.sendTime); // REMCONST
     }
+
+    if(host->keepConnectionsAlive)
+    {
+        for(tnet_u32 i = 0; i < host->maxConnections; i++)
+        {
+            if(host->conStates[i].state == CEDisconnected)
+                continue;
+            else if(getDurationMs(host->conStates[i].lastPacketSent, now) >= TNET_CONNECTION_TIMEOUT_MS/2)
+            {
+                tnet_queue_data(host, i, 0, 0, false, TNET_SEND_DATA_FLAG_HEARTBEAT);
+            }
+        }
+    }
 }
 
-void receivePacket(u32 connectionId, connectionState& connection, packet& p, i32 received, RingQueue* recBuf, HostEvent event)
+void receivePacket(tnet_host* host, tnet_u32 connectionId, tnet_connection_state& connection, tnet_packet& p, tnet_i32 received, tnet_ringqueue* recBuf, tnet_host_event_t event)
 {
-    i32 size = p.size;
+    tnet_i32 size = p.size;
     if(size != received) // packet size didn't match, corrupted or incomplete
     {
         printf("Corrupted packet 1\n");
@@ -568,42 +637,52 @@ void receivePacket(u32 connectionId, connectionState& connection, packet& p, i32
             return;
         }
         pthread_mutex_lock(&connection.conMutex); // <------------ CONNECTION MUTEX LOCK
-        clock_gettime(CLOCK_MONOTONIC, &connection.lastPacketReceived);
-        u16 messageId = p.relBody.messageId;
-        bool received = connection.receivedMessages[messageId%RECEIVED_MESSAGE_HISTORY_SIZE] == messageId;
-        if(!received)
+        net_get_time(connection.lastPacketReceived);
+
+        connection.packetsSinceAck++;
+        if(connection.packetsSinceAck >= 25) // REMCONST
+        {
+            tnet_queue_data(host, connectionId, 0, 0, true, TNET_SEND_DATA_FLAG_HEARTBEAT);
+            printf("Heartbeat\n");
+        }
+
+        tnet_u16 messageId = p.relBody.messageId;
+        bool shouldDrop = connection.receivedMessages[messageId%TNET_RECEIVED_MESSAGE_HISTORY_SIZE] == messageId;
+
+        if(!shouldDrop)
         {
             // TODO: replace assert with a useful measure (dc?)
-            i32 cur = connection.receivedMessages[messageId%RECEIVED_MESSAGE_HISTORY_SIZE];
-           // assert(cur == 0xFFFF || cur == (messageId-RECEIVED_MESSAGE_HISTORY_SIZE)); // if this fails, it means that either a reliable data was dropped or receivedMessages array overflowed
-            connection.receivedMessages[messageId%RECEIVED_MESSAGE_HISTORY_SIZE] = messageId;
+            tnet_i32 cur = connection.receivedMessages[messageId%TNET_RECEIVED_MESSAGE_HISTORY_SIZE];
+            assert(cur == 0xFFFF || cur == (messageId-TNET_RECEIVED_MESSAGE_HISTORY_SIZE)); // if this fails, it means that either a reliable data was dropped or receivedMessages array overflowed
+            connection.receivedMessages[messageId%TNET_RECEIVED_MESSAGE_HISTORY_SIZE] = messageId;
         }
+        shouldDrop = shouldDrop || (p.heartbeat == 1); // drop messages that are heartbeat
         // confirm what the remote party has received
         proccessRemoteAck(connection, p.relBody.ack, p.relBody.ackBits);
         // acknowledge the packet we received
         ackPacket(connection, p.relBody.seqId);
         pthread_mutex_unlock(&connection.conMutex);  // <------------ CONNECTION MUTEX UNLOCK
-        if(!received) // only receive if not received before
+        if(!shouldDrop) // only receive if not received before
         {
             // TODO: check buffer overflow?
-            ReceivedEvent buf;
+            tnet_received_event buf;
             buf.connection = connectionId;
             buf.size = p.relBody.size;
             buf.type = event;
             memcpy(buf.data, p.relBody.data, p.relBody.size);
-            bool qd = RingQueueQueueData(recBuf, &buf, sizeof(buf)-MAX_PACKET_SIZE+p.relBody.size);
+            bool qd = tnet_ringqueue_queue(recBuf, &buf, sizeof(buf)-TNET_MAX_PACKET_SIZE+p.relBody.size);
             assert(qd);
             //printf("reliable data: %s \n", (char*)p.relBody.data);
         }
     }
     else
     {
-        ReceivedEvent buf;
+        tnet_received_event buf;
         buf.connection = connectionId;
         buf.size = p.size-UREL_HEADER_SIZE; // 2 is the size of main header TODO:if you ever change header size
         buf.type = event;
         memcpy(buf.data, p.urelBody.data, buf.size);
-        bool qd = RingQueueQueueData(recBuf, &buf, sizeof(buf)-MAX_PACKET_SIZE+buf.size);
+        bool qd = tnet_ringqueue_queue(recBuf, &buf, sizeof(buf)-TNET_MAX_PACKET_SIZE+buf.size);
         assert(qd);
         //printf("unreliable data: %s \n", (char*)p.urelBody.data);
     }
@@ -611,63 +690,69 @@ void receivePacket(u32 connectionId, connectionState& connection, packet& p, i32
 
 struct receiveProcArgs
 {
-    Host* host;
+    tnet_host* host;
 };
 
 void* receiveProc(void* context)
 {
     receiveProcArgs* args = (receiveProcArgs*)context;
-    i32 socket = args->host->socket;
-    connectionState* connections = args->host->conStates;
-    u32 maxConnections = args->host->maxConnections;
-    RingQueue* receiveBuf = &args->host->receiveBuffer;
-    Host* host = args->host;
+    tnet_i32 socket = args->host->socket;
+    tnet_connection_state* connections = args->host->conStates;
+    tnet_u32 maxConnections = args->host->maxConnections;
+    tnet_ringqueue* receiveBuf = &args->host->receiveBuffer;
+    tnet_host* host = args->host;
     free(context);
-    packet buf;
-    i32 received;
-    u32 fromAddr;
-    u16 fromPort;
+    tnet_packet buf;
+    tnet_i32 received;
+    tnet_u32 fromAddr;
+    tnet_u16 fromPort;
     // TODO: packet bigger than 512 ends receiver thread!
     while(recvFromSocket(socket, (char*)&buf, received, fromAddr, fromPort))
     {
-        i32 conId = findActiveConnectionByDest(connections, maxConnections, fromAddr, fromPort);
+        tnet_i32 conId = findActiveConnectionByDest(connections, maxConnections, fromAddr, fromPort);
         if(conId != -1) // connection exists and active
         {
             // TODO: locking and unlocking 2 times in  a row
             pthread_mutex_lock(&connections[conId].conMutex);
-            ConnectionState cstate = host->conStates[conId].state;
+            tnet_connection_state_t cstate = host->conStates[conId].state;
             pthread_mutex_unlock(&connections[conId].conMutex);
 
-            if(cstate == ConnectionState::CEConnected)
-            {
-                pthread_mutex_lock(&host->receiveBufMutex);
-                receivePacket(conId, connections[conId],buf, received, receiveBuf, HostEvent::HEData);
-                pthread_mutex_unlock(&host->receiveBufMutex);
-            }
-            else if(cstate == ConnectionState::CEConnecting && buf.acceptCon)
+            if((cstate == CEConnected || cstate == CEConnecting) && buf.decline)
             {
                 pthread_mutex_lock(&connections[conId].conMutex);
-                connections[conId].state = ConnectionState::CEConnected;
+                disconnectConnection(host, conId);
+                pthread_mutex_unlock(&connections[conId].conMutex);
+            }
+            else if(cstate == tnet_connection_state_t::CEConnected)
+            {
+                pthread_mutex_lock(&host->receiveBufMutex);
+                receivePacket(host, conId, connections[conId],buf, received, receiveBuf, tnet_host_event_t::HEData);
+                pthread_mutex_unlock(&host->receiveBufMutex);
+            }
+            else if(cstate == tnet_connection_state_t::CEConnecting && buf.acceptCon)
+            {
+                pthread_mutex_lock(&connections[conId].conMutex);
+                connections[conId].state = tnet_connection_state_t::CEConnected;
                 pthread_mutex_unlock(&connections[conId].conMutex);
 
                 pthread_mutex_lock(&host->receiveBufMutex);
-                receivePacket(conId, connections[conId],buf, received, receiveBuf, HostEvent::HEConnect);
+                receivePacket(host, conId, connections[conId],buf, received, receiveBuf, tnet_host_event_t::HEConnect);
                 pthread_mutex_unlock(&host->receiveBufMutex);
             }
         }
         else if(buf.reqCon) // inactive or didn't exist
         {
-            i32 newConId = findAndResetInactiveConnectionSlot(connections, maxConnections);
+            tnet_i32 newConId = findAndResetInactiveConnectionSlot(connections, maxConnections);
             if(newConId != -1)
             {
                 pthread_mutex_lock(&connections[newConId].conMutex);
-                connections[newConId].state = ConnectionState::CEConnecting;
+                connections[newConId].state = tnet_connection_state_t::CEConnecting;
                 connections[newConId].destIP = fromAddr;
                 connections[newConId].destPort = fromPort;
                 pthread_mutex_unlock(&connections[newConId].conMutex);
 
                 pthread_mutex_lock(&host->receiveBufMutex);
-                receivePacket(newConId, connections[newConId],buf, received, receiveBuf, HostEvent::HEConnect);
+                receivePacket(host, newConId, connections[newConId],buf, received, receiveBuf, tnet_host_event_t::HEConnect);
                 pthread_mutex_unlock(&host->receiveBufMutex);
             }
             else
@@ -686,14 +771,14 @@ void* receiveProc(void* context)
 
 struct sendProcArgs
 {
-    Host* host;
+    tnet_host* host;
 };
 
 void* sendProc(void* context)
 {
     printf("Send worker started!\n");
     sendProcArgs* args = (sendProcArgs*)context;
-    Host* host = args->host;
+    tnet_host* host = args->host;
     free(context);
     pthread_mutex_lock (&host->sendMut);
     while(true)                      //if while loop with signal complete first don't wait
@@ -711,23 +796,43 @@ void* sendProc(void* context)
     return 0;
 }
 
-void CreateHost(Host* host, u16 port, i32 maxConnections)
+bool tnet_create_host(tnet_host* host, tnet_u16 port, tnet_i32 maxConnections)
 {
     host->maxConnections = maxConnections;
+    // TODO: add to settings
+    host->keepConnectionsAlive = true;
     //host->
     host->socket = openSocket(port);
     if(host->socket < 0)
-        return;
-    host->conStates = (connectionState*)malloc(maxConnections*sizeof(connectionState));
+        return false; // socket binding failed
+    host->conStates = (tnet_connection_state*)malloc(maxConnections*sizeof(tnet_connection_state));
+    if(host->conStates == 0)
+        return false; // memory allocation for connection states failed
     for(int i=0; i<maxConnections;i++)
     {
         initConnectionState(host->conStates[i]);
         host->conStates[i].socket = host->socket;
     }
+    // init buffer pointers to null so we dont crash when trying to free them
+    host->resendBuffer.startAddr = 0;
+    host->sendBuffer.startAddr = 0;
+    host->receiveBuffer.startAddr = 0;
     // TODO: scale buffer size based on max connections?
-    RingQueueInitialize(&host->resendBuffer, Megabytes(10));
-    RingQueueInitialize(&host->sendBuffer, Megabytes(1));
-    RingQueueInitialize(&host->receiveBuffer, Megabytes(1));
+    if(!tnet_ringqueue_initialize(&host->resendBuffer, tnet_Megabytes(10)))
+    {
+        tnet_free_host(host);
+        return false; // memory allocation failed
+    }
+    if(!tnet_ringqueue_initialize(&host->sendBuffer, tnet_Megabytes(1)))
+    {
+        tnet_free_host(host);
+        return false; // memory allocation failed
+    }
+    if(!tnet_ringqueue_initialize(&host->receiveBuffer, tnet_Megabytes(1)))
+    {
+        tnet_free_host(host);
+        return false; // memory allocation failed
+    }
     host->sendDone = true;
     host->sendMut=PTHREAD_MUTEX_INITIALIZER;
     host->sendCon=PTHREAD_COND_INITIALIZER;
@@ -738,44 +843,56 @@ void CreateHost(Host* host, u16 port, i32 maxConnections)
     if(pthread_create(&host->recWorker, 0, receiveProc, wargs))
     {
         printf("Creating worker thread for host failed!\n");
-        FreeHost(host);
-        // TODO: return false?
-        return;
+        tnet_free_host(host);
+        return false;
     }
     sendProcArgs* swargs = new sendProcArgs;
     swargs->host = host;
     if(pthread_create(&host->sendWorker, 0, sendProc, swargs))
     {
         printf("Creating worker thread for host failed!\n");
-        FreeHost(host);
-        // TODO: return false?
-        return;
+        tnet_free_host(host);
+        return false;
     }
+    return true;
 }
 
-void FreeHost(Host* host)
+void tnet_free_host(tnet_host* host)
 {
-    // TODO: end thread
+    // TODO: end thread in a better way
+    int canc = pthread_cancel(host->sendWorker);
+    canc = pthread_cancel(host->recWorker);
+    if(canc != 0)
+    {
+        printf("Canceling one of the threads failed!\n");
+    }
+
+    void *res;
+    pthread_join(host->sendWorker,&res);
+    pthread_join(host->recWorker,&res);
+
     //host->recWorker.join
     closeSocket(host->socket);
     free(host->conStates);
-    RingQueueFreeMemory(&host->resendBuffer);
-    RingQueueFreeMemory(&host->sendBuffer);
-    RingQueueFreeMemory(&host->receiveBuffer);
+    tnet_ring_queue_free(&host->resendBuffer);
+    tnet_ring_queue_free(&host->sendBuffer);
+    tnet_ring_queue_free(&host->receiveBuffer);
+
+    printf("Goodbye! o/\n");
 }
 
-HostEvent getNextEvent(Host* host, i32& connection, char* data, u32 size, i32& recSize)
+tnet_host_event_t tnet_get_next_event(tnet_host* host, tnet_i32& connection, char* data, tnet_u32 size, tnet_i32& recSize)
 {
     // TODO: 2 memcpys, remove 1
     // TODO: sure that no buffer overflow can happen?
-    ReceivedEvent event;
+    tnet_received_event event;
     pthread_mutex_lock(&host->receiveBufMutex);
-    size_t result = RingQueueDequeueData(&host->receiveBuffer, &event, sizeof(event));
+    size_t result = tnet_ringqueue_dequeue(&host->receiveBuffer, &event, sizeof(event));
     pthread_mutex_unlock(&host->receiveBufMutex);
     if(result > 0)
     {
         connection = event.connection;
-        if(event.type == HostEvent::HEData && size >= event.size)
+        if(event.type == tnet_host_event_t::HEData && size >= event.size)
         {
             memcpy(data, event.data, event.size);
             recSize = event.size;
@@ -784,11 +901,11 @@ HostEvent getNextEvent(Host* host, i32& connection, char* data, u32 size, i32& r
     }
     else
     {
-        return HostEvent::HENothing;
+        return tnet_host_event_t::HENothing;
     }
 }
 
-void sendPendingData(Host* host)
+void tnet_release_pending_data(tnet_host* host)
 {
     pthread_mutex_lock (&host->sendMut);
     /*if(!host->sendDone)
@@ -800,10 +917,10 @@ void sendPendingData(Host* host)
     //pthread_yield(); // just in case
 }
 
-void sendData(Host* host, i32 connection, const char* data, const i32 dataSize, const bool reliable, u32 flags)
+void tnet_queue_data(tnet_host* host, tnet_i32 connection, const char* data, const tnet_i32 dataSize, const bool reliable, tnet_u32 flags)
 {
     // TODO: basically 2 memcpys, remove 1
-    QueuedData buf;
+    tnet_queued_data buf;
     buf.flags = flags;
     buf.connection = connection;
     buf.size = dataSize;
@@ -811,44 +928,44 @@ void sendData(Host* host, i32 connection, const char* data, const i32 dataSize, 
     memcpy(buf.data, data, dataSize);
 
     pthread_mutex_lock(&host->sendBufMutex);
-    bool qd = RingQueueQueueData(&host->sendBuffer, (char*)&buf, sizeof(QueuedData)+dataSize-MAX_PACKET_SIZE);
+    bool qd = tnet_ringqueue_queue(&host->sendBuffer, (char*)&buf, sizeof(tnet_queued_data)+dataSize-TNET_MAX_PACKET_SIZE);
     assert(qd);
     pthread_mutex_unlock(&host->sendBufMutex);
 }
 
-bool RingQueueInitialize(RingQueue* dq, size_t size)
+bool tnet_ringqueue_initialize(tnet_ringqueue* dq, size_t size)
 {
     dq->startAddr = (char*)malloc(size);
     dq->dequeuePointer = dq->startAddr;
     dq->queuePointer = dq->startAddr;
-    dq->state = RingQueueState::Empty;
+    dq->state = tnet_ringqueue_state_t::Empty;
     dq->size = size;
     return dq->startAddr != NULL;
 }
 
-void RingQueueFreeMemory(RingQueue* dq)
+void tnet_ring_queue_free(tnet_ringqueue* dq)
 {
-    assert(dq->startAddr != NULL);
-    free(dq->startAddr);
+    if(dq->startAddr != NULL)
+        free(dq->startAddr);
 }
 
 // sets to empty state
-void RingQueueReset(RingQueue* dq)
+void tnet_ringqueue_reset(tnet_ringqueue* dq)
 {
     dq->dequeuePointer = dq->startAddr;
     dq->queuePointer = dq->startAddr;
-    dq->state = RingQueueState::Empty;
+    dq->state = tnet_ringqueue_state_t::Empty;
 }
 
 // a reset with zeroing
-void RingQueueZeroMemory(RingQueue* dq)
+void RingQueueZeroMemory(tnet_ringqueue* dq)
 {
     memset(dq->startAddr, 0, dq->size);
-    RingQueueReset(dq);
+    tnet_ringqueue_reset(dq);
 }
 
 // queues data to the buffer and returns true on success
-bool RingQueueQueueData(RingQueue* dq, const void* data, size_t size)
+bool tnet_ringqueue_queue(tnet_ringqueue* dq, const void* data, size_t size)
 {
     if (size <= 0)
         return false;
@@ -870,7 +987,7 @@ bool RingQueueQueueData(RingQueue* dq, const void* data, size_t size)
     }
     if ((pointer < dq->dequeuePointer && next >= dq->dequeuePointer) /*|| // buffer overflow would happen                                                                                                                             (pointer >= dq->dequeuePointer && next <= dq->dequeuePointer)*/)
     {
-        dq->state = RingQueueState::Full;
+        dq->state = tnet_ringqueue_state_t::Full;
         return false;
     }
     *(size_t*)pointer = size;
@@ -878,17 +995,17 @@ bool RingQueueQueueData(RingQueue* dq, const void* data, size_t size)
     memcpy(pointer, data, size);
     pointer += size;
     dq->queuePointer = pointer;
-    if (dq->state == RingQueueState::Empty)
+    if (dq->state == tnet_ringqueue_state_t::Empty)
     {
-        dq->state = RingQueueState::None;
+        dq->state = tnet_ringqueue_state_t::None;
     }
     return true;
 }
 
 // dequeues data from the buffer and returns number of bytes read
-size_t RingQueueDequeueData(RingQueue* dq, void* data, unsigned int size)
+size_t tnet_ringqueue_dequeue(tnet_ringqueue* dq, void* data, unsigned int size)
 {
-    if (dq->state == RingQueueState::Empty) // if its empty then its empty...
+    if (dq->state == tnet_ringqueue_state_t::Empty) // if its empty then its empty...
     {
         return 0;
     }
@@ -917,14 +1034,14 @@ size_t RingQueueDequeueData(RingQueue* dq, void* data, unsigned int size)
     memcpy(data, pointer, cursize);
     dq->dequeuePointer = pointer + cursize;
     if (dq->queuePointer == dq->dequeuePointer)
-        dq->state = RingQueueState::Empty;
+        dq->state = tnet_ringqueue_state_t::Empty;
     return cursize > 0;
 }
 
 // does the same as dequeuedata, but doesnt remove the data from queue
-size_t RingQueuePeekData(RingQueue* dq, void* data, unsigned int size)
+size_t tnet_ringqueue_peek(tnet_ringqueue* dq, void* data, unsigned int size)
 {
-    if (dq->state == RingQueueState::Empty) // if its empty then its empty...
+    if (dq->state == tnet_ringqueue_state_t::Empty) // if its empty then its empty...
     {
         return 0;
     }
@@ -954,16 +1071,16 @@ size_t RingQueuePeekData(RingQueue* dq, void* data, unsigned int size)
     return cursize > 0;
 }
 
-RingQueueState RingQueueGetState(RingQueue* dq)
+tnet_ringqueue_state_t RingQueueGetState(tnet_ringqueue* dq)
 {
-    RingQueueState state;
+    tnet_ringqueue_state_t state;
     state = dq->state;
     return state;
 }
 
-bool RingQueueDequeue(RingQueue* dq)
+bool tnet_ringqueue_drop(tnet_ringqueue* dq)
 {
-    if (dq->state == RingQueueState::Empty) // if its empty then its empty...
+    if (dq->state == tnet_ringqueue_state_t::Empty) // if its empty then its empty...
     {
         return 0;
     }
@@ -987,8 +1104,8 @@ bool RingQueueDequeue(RingQueue* dq)
     pointer += sizeof(size_t);
     dq->dequeuePointer = pointer + cursize;
     if (dq->queuePointer == dq->dequeuePointer)
-    dq->state = RingQueueState::Empty;
+    dq->state = tnet_ringqueue_state_t::Empty;
     return cursize > 0;
 }
-//#endif // TNET_IMPLEMENTATION
+#endif // TNET_IMPLEMENTATION
 #endif // TNET_H

@@ -1,4 +1,5 @@
 TODO:
+	Socket binding etc error handling
 	Sequenced reliable packets
 	Option to drop unordered unreliable packets
 	Ping/RTT measuring
@@ -9,13 +10,17 @@ TODO:
 	Windows support
 	Mac OSX support
 	Usage examples
+	Compability with C
+	If resend buffer is full, stop sending reliable messages
+	Disconnecting and declining
 
 DONE:
 	Virtual connection
 	Optional reliability for data
 	Sparate thread(s)
 	Simple 2-way handshake for connecting
-	Connection timeounts
+	Connection timeouts
+	Keeping connections alive
 
 DON'T KNOW IF I WANT:
 	File transmisson
