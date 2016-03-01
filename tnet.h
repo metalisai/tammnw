@@ -1,3 +1,4 @@
+// TODO: this won't work
 #ifndef TNET_H
 #define TNET_H
 
@@ -34,11 +35,19 @@ typedef uint16_t tnet_u16;
 #define TNET_SEND_DATA_FLAG_ACCCON       1<<1
 #define TNET_SEND_DATA_FLAG_HEARTBEAT    1<<2
 #define TNET_SEND_DATA_FLAG_DECLINE      1<<3
+#define TNET_SEND_DATA_FLAG_PING         1<<4 // TODO: add to the packet forming code
 
 #define TNET_MAX_PACKET_SIZE 512
 #define TNET_CONFIRMED_PACKETS_HISTORY_SIZE  512
 
 #define TNET_CONNECTION_TIMEOUT_MS   10000
+#define TNET_PING_INTERVAL_MS           1000
+
+#define TNET_PING_TYPE_PING 1
+#define TNET_PING_TYPE_PINGBACK 2
+
+#define TNET_PING_MESSSAGE_SIZE 3
+#define TNET_PING_IS_RELIABLE   0
 
 enum tnet_connection_state_t
 {
@@ -81,12 +90,21 @@ struct tnet_connection_state
     tnet_u16 destPort;
     tnet_u16 messageId;
     tnet_u32 packetsSinceAck;
+    tnet_u32 ping;
     tnet_connection_state_t state;
     tnet_time_point lastPacketReceived;
     tnet_time_point lastPacketSent;
+    tnet_time_point lastPingRequest;
     tnet_u32 confirmedPackets[TNET_CONFIRMED_PACKETS_HISTORY_SIZE];
     tnet_u16 receivedMessages[TNET_RECEIVED_MESSAGE_HISTORY_SIZE];
     pthread_mutex_t conMutex;
+};
+
+struct tnet_host_settings
+{
+    bool keepConnectionsAlive;
+    // TODO: implement
+    tnet_u32 maxReceiveAllocPerConnection; // how many bytes from receive Queue can one connection allocate
 };
 
 struct tnet_host
@@ -130,8 +148,9 @@ void tnet_queue_data(tnet_host* host, tnet_i32 connection, const char* data, con
 void tnet_release_pending_data(tnet_host* host);
 void tnet_disconnect(tnet_host* host, tnet_u32 connectionId);
 tnet_i32 tnet_accept(tnet_host* host, tnet_i32 conId);
+unsigned short tnet_get_ping(tnet_host* host, unsigned int connectionId);
 
-#ifdef TNET_IMPLEMENTATION
+//#ifdef TNET_IMPLEMENTATION
 
 struct tnet_received_event
 {
@@ -146,6 +165,7 @@ struct tnet_queued_data
     tnet_i32 connection;
     tnet_i32 size;
     tnet_u32 flags;
+    tnet_time_point queuedAt;
     char data[TNET_MAX_PACKET_SIZE];
 };
 struct tnet_sent_reliable_data
@@ -182,7 +202,7 @@ struct tnet_packet
     unsigned char acceptCon : 1;
     unsigned char heartbeat : 1;
     unsigned char decline : 1;
-    unsigned char reserved : 1;
+    unsigned char ping : 1;
     tnet_u16 size : 10;
     union
     {
@@ -211,7 +231,7 @@ inline void net_get_time(tnet_time_point& to)
 #endif
 }
 
-inline tnet_i32 getDurationToNowMs(tnet_time_point pastPoint)
+inline tnet_i32 getDurationToNowMs(const tnet_time_point pastPoint)
 {
 #ifdef TNET_PLATFORM_LINUX
     tnet_time_point now;
@@ -223,7 +243,7 @@ inline tnet_i32 getDurationToNowMs(tnet_time_point pastPoint)
 #endif
 }
 
-inline tnet_i32 getDurationMs(tnet_time_point from, tnet_time_point to)
+inline tnet_i32 getDurationMs(const tnet_time_point from, const tnet_time_point to)
 {
 #ifdef TNET_PLATFORM_LINUX
     double dif = (to.tv_sec-from.tv_sec)*1000+(to.tv_nsec-from.tv_nsec)/1000000;
@@ -333,7 +353,9 @@ void initConnectionState(tnet_connection_state& state)
     state.conMutex = PTHREAD_MUTEX_INITIALIZER;
     state.messageId = 0;
     state.packetsSinceAck = 0;
+    state.ping = 0xFFFFF;
     net_get_time(state.lastPacketReceived);
+    state.lastPingRequest = state.lastPingRequest;
     for(int i=0; i< TNET_CONFIRMED_PACKETS_HISTORY_SIZE;i++)
     {
         state.confirmedPackets[i] = 0xFFFFFFFF;
@@ -464,6 +486,21 @@ tnet_i32 tnet_accept(tnet_host* host, tnet_i32 conId)
     return conId;
 }
 
+void queue_ping_message(tnet_host* host, tnet_u32 connection)
+{
+    char data[3]; // bytes 1 and 2 will be added when sending (latency in ms between queueing and actual sending)
+    data[0] = TNET_PING_TYPE_PING;
+    tnet_queue_data(host, connection, data, TNET_PING_MESSSAGE_SIZE, TNET_PING_IS_RELIABLE, TNET_SEND_DATA_FLAG_PING);
+}
+
+void queue_pingback_message(tnet_host* host, tnet_u32 connection, tnet_u16 latency)
+{
+    char data[3]; // bytes 1 and 2 will be added when sending (latency in ms between queueing and actual sending)
+    data[0] = TNET_PING_TYPE_PINGBACK;
+    *((tnet_u16*)&data[1]) = latency;
+    tnet_queue_data(host, connection, data, TNET_PING_MESSSAGE_SIZE, TNET_PING_IS_RELIABLE, TNET_SEND_DATA_FLAG_PING);
+}
+
 void QDataToPacket(tnet_queued_data& q, tnet_packet& p, tnet_u32 ack, tnet_u32 ackBits, tnet_u32 seqId, tnet_u16 messageId)
 {
     p.hasRel = q.reliable;
@@ -471,7 +508,7 @@ void QDataToPacket(tnet_queued_data& q, tnet_packet& p, tnet_u32 ack, tnet_u32 a
     p.acceptCon = (q.flags & TNET_SEND_DATA_FLAG_ACCCON) != 0;
     p.heartbeat = (q.flags & TNET_SEND_DATA_FLAG_HEARTBEAT) != 0;
     p.decline = (q.flags & TNET_SEND_DATA_FLAG_DECLINE) != 0;
-    p.reserved = 0;
+    p.ping = (q.flags & TNET_SEND_DATA_FLAG_PING) != 0;
     if(q.reliable)
     {
         // REMCONST
@@ -506,6 +543,26 @@ void sendPacket(tnet_host* host, tnet_packet& p, tnet_queued_data& q, tnet_u16 m
     connections[q.connection].lastPacketSent = now;
     tnet_sent_reliable_data rdata;
     QDataToPacket(q, p, connections[q.connection].ack, connections[q.connection].ackBits, connections[q.connection].seqId++, messageId);
+
+    if(p.ping) // if this is a ping packet, then add the send-queuedAt latency to it
+    {
+        assert(q.size == TNET_PING_MESSSAGE_SIZE);
+        assert(q.reliable == TNET_PING_IS_RELIABLE);
+#if TNET_PING_IS_RELIABLE
+        unsigned char* data = p.relBody.data;
+#else
+        unsigned char* data= p.urelBody.data;
+#endif
+        if(data[0] == TNET_PING_TYPE_PING)
+        {
+            *((tnet_u16*)&data[1]) = (tnet_u16)getDurationMs(q.queuedAt,now);
+        }
+        else
+        {
+            assert(data[0] == TNET_PING_TYPE_PINGBACK);
+            *((tnet_u16*)&data[1]) += (tnet_u16)getDurationMs(q.queuedAt,now);
+        }
+    }
 
     if(q.reliable)
     {
@@ -568,9 +625,30 @@ void checkConnectionStates(tnet_host* host)
     }
 }
 
+unsigned short tnet_get_ping(tnet_host* host, unsigned int connectionId)
+{
+    // TODO: is this safe (another thread could be modifying the ping, but do we reallt care?)
+    // TODO: what if connectionId is invalid
+    return (unsigned short)host->conStates[connectionId].ping;
+}
 
 void sendPackets(tnet_host* host)
 {
+    tnet_time_point now;
+    net_get_time(now);
+    // queue ping messages where needed
+    for(tnet_u32 i = 0; i < host->maxConnections; i++)
+    {
+        if(host->conStates[i].state == CEDisconnected)
+            continue;
+        else if(getDurationMs(host->conStates[i].lastPingRequest, now) >= TNET_PING_INTERVAL_MS)
+        {
+            // TODO: mutex
+            host->conStates[i].lastPingRequest = now;
+            queue_ping_message(host, i);
+        }
+    }
+
     tnet_queued_data q;
     tnet_packet p;
 
@@ -578,12 +656,12 @@ void sendPackets(tnet_host* host)
     pthread_mutex_lock(&host->sendBufMutex);
     // TODO: what happens if buf too small?
     // TODO: can invalid connectionid get here?
-    tnet_time_point now;
-    net_get_time(now);
     while(tnet_ringqueue_dequeue(&host->sendBuffer, &q, sizeof(q)) > 0)
     {
         pthread_mutex_lock(&connections[q.connection].conMutex);
-        sendPacket(host, p, q, connections[q.connection].messageId++, now);
+        sendPacket(host, p, q, connections[q.connection].messageId, now);
+        if(q.reliable)
+            connections[q.connection].messageId++;
         pthread_mutex_unlock(&connections[q.connection].conMutex);
     }
     pthread_mutex_unlock(&host->sendBufMutex);
@@ -607,6 +685,7 @@ void sendPackets(tnet_host* host)
             dif = getDurationToNowMs(rdata.sendTime); // REMCONST
     }
 
+    // keep connections alive
     if(host->keepConnectionsAlive)
     {
         for(tnet_u32 i = 0; i < host->maxConnections; i++)
@@ -653,7 +732,7 @@ void receivePacket(tnet_host* host, tnet_u32 connectionId, tnet_connection_state
         {
             // TODO: replace assert with a useful measure (dc?)
             tnet_i32 cur = connection.receivedMessages[messageId%TNET_RECEIVED_MESSAGE_HISTORY_SIZE];
-            assert(cur == 0xFFFF || cur == (messageId-TNET_RECEIVED_MESSAGE_HISTORY_SIZE)); // if this fails, it means that either a reliable data was dropped or receivedMessages array overflowed
+            assert(cur == 0xFFFF || cur == (tnet_u16)(messageId-TNET_RECEIVED_MESSAGE_HISTORY_SIZE)); // if this fails, it means that either a reliable data was dropped or receivedMessages array overflowed
             connection.receivedMessages[messageId%TNET_RECEIVED_MESSAGE_HISTORY_SIZE] = messageId;
         }
         shouldDrop = shouldDrop || (p.heartbeat == 1); // drop messages that are heartbeat
@@ -693,6 +772,28 @@ struct receiveProcArgs
     tnet_host* host;
 };
 
+void proccessPing(tnet_host* host, tnet_u32 connection, unsigned char* data)
+{
+    unsigned char type = data[0];
+    tnet_u16 latency;
+    switch(type)
+    {
+    case TNET_PING_TYPE_PING: // request to ping back
+        queue_pingback_message(host,connection,*((tnet_u16*)&data[1]));
+        break;
+    case TNET_PING_TYPE_PINGBACK: // response to our (we assume latest) ping request
+        pthread_mutex_lock(&host->conStates[connection].conMutex);
+        latency = *((tnet_u16*)&data[1]);
+        tnet_time_point now;
+        net_get_time(now);
+        host->conStates[connection].ping = getDurationMs(host->conStates[connection].lastPingRequest,now)-latency;
+        pthread_mutex_unlock(&host->conStates[connection].conMutex);
+        break;
+    default:
+        assert(false); // this should only happen with corrupt packets
+        break;
+    }
+}
 void* receiveProc(void* context)
 {
     receiveProcArgs* args = (receiveProcArgs*)context;
@@ -717,17 +818,32 @@ void* receiveProc(void* context)
             tnet_connection_state_t cstate = host->conStates[conId].state;
             pthread_mutex_unlock(&connections[conId].conMutex);
 
-            if((cstate == CEConnected || cstate == CEConnecting) && buf.decline)
+            if((cstate == CEConnected || cstate == CEConnecting) && buf.decline) // disconnect signal
             {
                 pthread_mutex_lock(&connections[conId].conMutex);
                 disconnectConnection(host, conId);
                 pthread_mutex_unlock(&connections[conId].conMutex);
             }
-            else if(cstate == tnet_connection_state_t::CEConnected)
+            // TODO: wat is this shit
+            else if(cstate == tnet_connection_state_t::CEConnected
+                    && !buf.reqCon
+                    && !buf.acceptCon
+                    && !buf.decline
+                    && !buf.heartbeat
+                    && !buf.ping) // regular data
             {
                 pthread_mutex_lock(&host->receiveBufMutex);
+                if(buf.relBody.size != 86 && buf.relBody.size != 4)
+                {
+                    printf("what");
+                }
                 receivePacket(host, conId, connections[conId],buf, received, receiveBuf, tnet_host_event_t::HEData);
                 pthread_mutex_unlock(&host->receiveBufMutex);
+            }
+            // TODO: macro for packet size for reliable ping message
+            else if(cstate == tnet_connection_state_t::CEConnected && buf.size-UREL_HEADER_SIZE == TNET_PING_MESSSAGE_SIZE) // ping packet
+            {
+                proccessPing(host, conId, buf.urelBody.data);
             }
             else if(cstate == tnet_connection_state_t::CEConnecting && buf.acceptCon)
             {
@@ -925,6 +1041,7 @@ void tnet_queue_data(tnet_host* host, tnet_i32 connection, const char* data, con
     buf.connection = connection;
     buf.size = dataSize;
     buf.reliable = reliable;
+    net_get_time(buf.queuedAt);
     memcpy(buf.data, data, dataSize);
 
     pthread_mutex_lock(&host->sendBufMutex);
@@ -947,6 +1064,21 @@ void tnet_ring_queue_free(tnet_ringqueue* dq)
 {
     if(dq->startAddr != NULL)
         free(dq->startAddr);
+}
+
+// TODO: test before using this
+bool tnet_ringqueue_doublesize(tnet_ringqueue* dq)
+{
+    char* newMem = (char*)malloc(dq->size*2);
+    if(newMem == 0)
+        return false;
+    dq->dequeuePointer = newMem+(dq->dequeuePointer-dq->startAddr);
+    dq->queuePointer = newMem+(dq->queuePointer-dq->startAddr);
+    memmove(newMem,dq->startAddr,dq->size);
+    dq->size *= 2;
+    free(dq->startAddr);
+    dq->startAddr = newMem;
+    return true;
 }
 
 // sets to empty state
@@ -1107,5 +1239,5 @@ bool tnet_ringqueue_drop(tnet_ringqueue* dq)
     dq->state = tnet_ringqueue_state_t::Empty;
     return cursize > 0;
 }
-#endif // TNET_IMPLEMENTATION
+//#endif // TNET_IMPLEMENTATION
 #endif // TNET_H

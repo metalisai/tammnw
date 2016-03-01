@@ -12,7 +12,7 @@ TODO:
 	Usage examples
 	Compability with C
 	If resend buffer is full, stop sending reliable messages
-	Disconnecting and declining
+	Reduce header sizes
 
 DONE:
 	Virtual connection
@@ -21,6 +21,7 @@ DONE:
 	Simple 2-way handshake for connecting
 	Connection timeouts
 	Keeping connections alive
+	Disconnecting and declining
 
 DON'T KNOW IF I WANT:
 	File transmisson
