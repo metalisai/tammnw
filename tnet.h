@@ -21,6 +21,9 @@
 
 #include <cstdint>
 
+#define TNET_SIMULATE_PACKETLOSS   0 // 1 = 33% packetloss
+#define TNET_SIMULATE_REPEAT       0 // 1 = every packet is sent twice (for testing if anything reliable is received multiple times)
+
 typedef int64_t tnet_i64;
 typedef int32_t tnet_i32;
 typedef int16_t tnet_i16;
@@ -56,7 +59,7 @@ enum tnet_connection_state_t
     CEConnected
 };
 
-#define TNET_RECEIVED_MESSAGE_HISTORY_SIZE   4096 // POWER OF 2 ONLY
+#define TNET_RECEIVED_MESSAGE_HISTORY_SIZE   4096 // POWER OF 2 ONLY, larger that 16k not reccommended
 
 enum tnet_ringqueue_state_t
 {
@@ -97,7 +100,6 @@ struct tnet_connection_state
     tnet_time_point lastPingRequest;
     tnet_u32 confirmedPackets[TNET_CONFIRMED_PACKETS_HISTORY_SIZE];
     tnet_u16 receivedMessages[TNET_RECEIVED_MESSAGE_HISTORY_SIZE];
-    pthread_mutex_t conMutex;
 };
 
 struct tnet_host_settings
@@ -118,16 +120,13 @@ struct tnet_host
     tnet_ringqueue resendBuffer;
     // receive buffer
     // holds ReceivedMessage structs
-    pthread_mutex_t receiveBufMutex;
     tnet_ringqueue receiveBuffer;
     // send buffer
     // holds QueuedMessage structs
     tnet_ringqueue sendBuffer;
-    pthread_mutex_t sendBufMutex;
-    pthread_t recWorker;
-    pthread_t sendWorker;
+    pthread_t netThread;
     volatile bool sendDone;
-    pthread_mutex_t sendMut;
+    pthread_mutex_t mutex;
     pthread_cond_t sendCon;
 
 };
@@ -146,11 +145,12 @@ void tnet_free_host(tnet_host* host);
 tnet_host_event_t tnet_get_next_event(tnet_i32 connection, char* buf, int& received);
 void tnet_queue_data(tnet_host* host, tnet_i32 connection, const char* data, const tnet_i32 dataSize, const bool reliable, tnet_u32 flags = 0);
 void tnet_release_pending_data(tnet_host* host);
+tnet_i32 tnet_connect(tnet_host* host, tnet_u32 destIp, tnet_u16 destPort);
 void tnet_disconnect(tnet_host* host, tnet_u32 connectionId);
 tnet_i32 tnet_accept(tnet_host* host, tnet_i32 conId);
 unsigned short tnet_get_ping(tnet_host* host, unsigned int connectionId);
 
-//#ifdef TNET_IMPLEMENTATION
+#ifdef TNET_IMPLEMENTATION
 
 struct tnet_received_event
 {
@@ -286,7 +286,7 @@ tnet_i32 openSocket(tnet_u16 port)
         return -1;
     }
     // set blocking mode
-    tnet_u32 blocking = 1;
+    tnet_u32 blocking = 0;
     tnet_u32 flags = fcntl(nsock, F_GETFL, 0);
     if (blocking)
         flags &= ~O_NONBLOCK;
@@ -309,8 +309,13 @@ tnet_i32 sendToSocket(tnet_i32 socket, void* data, tnet_u16 size, tnet_u32 destI
     address.sin_port = htons((unsigned short)destPort);
     tnet_i32 sentBytes = 1;
     // uncomment for 33% packetloss
-    //if(random() % 3 != 1)
+#if TNET_SIMULATE_PACKETLOSS
+    if(random() % 3 != 1)
+#endif
         sentBytes = sendto(socket, data, size, 0, (sockaddr*)&address, sizeof(sockaddr_in));
+#if TNET_SIMULATE_REPEAT
+        sentBytes = sendto(socket, data, size, 0, (sockaddr*)&address, sizeof(sockaddr_in));
+#endif
     if(sentBytes <= 0)
     {
         printf("sendToSocket failed!\n");
@@ -325,7 +330,7 @@ bool recvFromSocket(tnet_i32 socket, char* data, tnet_i32& received, tnet_u32& f
     socklen_t fromLength = sizeof(from);
     tnet_i32 ss;
     ss = recvfrom(socket, (char*)data, TNET_MAX_PACKET_SIZE, 0, (sockaddr*)&from, &fromLength);
-    if(ss == -1)
+    if(ss == -1 && errno != 11)
     {
         printf("recvfrom failed errno:%d\n",errno);
     }
@@ -350,7 +355,6 @@ void initConnectionState(tnet_connection_state& state)
     state.socket = -1;
     state.state = tnet_connection_state_t::CEDisconnected;
     // TODO: make platform independent!
-    state.conMutex = PTHREAD_MUTEX_INITIALIZER;
     state.messageId = 0;
     state.packetsSinceAck = 0;
     state.ping = 0xFFFFF;
@@ -371,13 +375,11 @@ tnet_i32 findAndResetInactiveConnectionSlot(tnet_connection_state* connections, 
     tnet_i32 ret = -1;
     for(int i = 0; i < maxConnections; i++)
     {
-        pthread_mutex_lock(&connections[i].conMutex);
         if(connections[i].state == tnet_connection_state_t::CEDisconnected)
         {
             initConnectionState(connections[i]);
             ret = i;
         }
-        pthread_mutex_unlock(&connections[i].conMutex);
         if(ret != -1)
             break;
     }
@@ -390,12 +392,10 @@ tnet_i32 findActiveConnectionByDest(tnet_connection_state* connections, int maxC
     tnet_i32 ret = -1;
     for(int i = 0; i < maxConnections; i++)
     {
-        pthread_mutex_lock(&connections[i].conMutex);
         if(connections[i].state != tnet_connection_state_t::CEDisconnected && connections[i].destIP == ip && connections[i].destPort == port)
         {
             ret = i;
         }
-        pthread_mutex_unlock(&connections[i].conMutex);
         if(ret != -1)
             break;
     }
@@ -448,57 +448,6 @@ void ackPacket(tnet_connection_state& connection, tnet_u32 remSeq)
         unsigned int mask = 1 << difference;
         connection.ackBits |= mask;
     }
-}
-
-// TODO: accept strings
-tnet_i32 hostConnect(tnet_host* host, tnet_u32 destIp, tnet_u16 destPort)
-{
-    tnet_i32 conId = findAndResetInactiveConnectionSlot(host->conStates, host->maxConnections);
-    if(conId >= 0)
-    {
-        pthread_mutex_lock(&host->conStates[conId].conMutex);
-        host->conStates[conId].destIP = destIp;
-        host->conStates[conId].destPort = destPort;
-        host->conStates[conId].state = tnet_connection_state_t::CEConnecting;
-        pthread_mutex_unlock(&host->conStates[conId].conMutex);
-        tnet_queue_data(host, conId, (char*)0, 0, true, TNET_SEND_DATA_FLAG_REQCON);
-    }
-    else
-    {
-        printf("Tried to start new connection when out of slots!\n");
-    }
-    return conId;
-}
-
-tnet_i32 tnet_accept(tnet_host* host, tnet_i32 conId)
-{
-    if(conId >= 0)
-    {
-        pthread_mutex_lock(&host->conStates[conId].conMutex);
-        host->conStates[conId].state = tnet_connection_state_t::CEConnected;
-        pthread_mutex_unlock(&host->conStates[conId].conMutex);
-        tnet_queue_data(host, conId, (char*)0, 0, true, TNET_SEND_DATA_FLAG_ACCCON);
-    }
-    else
-    {
-        printf("Tried to accept invalid connection!\n");
-    }
-    return conId;
-}
-
-void queue_ping_message(tnet_host* host, tnet_u32 connection)
-{
-    char data[3]; // bytes 1 and 2 will be added when sending (latency in ms between queueing and actual sending)
-    data[0] = TNET_PING_TYPE_PING;
-    tnet_queue_data(host, connection, data, TNET_PING_MESSSAGE_SIZE, TNET_PING_IS_RELIABLE, TNET_SEND_DATA_FLAG_PING);
-}
-
-void queue_pingback_message(tnet_host* host, tnet_u32 connection, tnet_u16 latency)
-{
-    char data[3]; // bytes 1 and 2 will be added when sending (latency in ms between queueing and actual sending)
-    data[0] = TNET_PING_TYPE_PINGBACK;
-    *((tnet_u16*)&data[1]) = latency;
-    tnet_queue_data(host, connection, data, TNET_PING_MESSSAGE_SIZE, TNET_PING_IS_RELIABLE, TNET_SEND_DATA_FLAG_PING);
 }
 
 void QDataToPacket(tnet_queued_data& q, tnet_packet& p, tnet_u32 ack, tnet_u32 ackBits, tnet_u32 seqId, tnet_u16 messageId)
@@ -580,6 +529,8 @@ void sendPacket(tnet_host* host, tnet_packet& p, tnet_queued_data& q, tnet_u16 m
     sendToSocket(host->socket, &p, p.size, connections[q.connection].destIP, connections[q.connection].destPort);
 }
 
+
+void tnet_queue_data_int(tnet_host* host, tnet_i32 connection, const char* data, const tnet_i32 dataSize, const bool reliable, tnet_u32 flags);
 // lock connection mutex!
 void disconnectConnection(tnet_host* host, tnet_u32 connectionId)  // internal version
 {
@@ -587,24 +538,22 @@ void disconnectConnection(tnet_host* host, tnet_u32 connectionId)  // internal v
     if(host->conStates[connectionId].state != CEDisconnected)
     {
         host->conStates[connectionId].state = CEDisconnected;
-        pthread_mutex_lock(&host->receiveBufMutex);
         tnet_received_event buf;
         buf.connection = connectionId;
         buf.size = 0;
         buf.type = tnet_host_event_t::HEDisconnect;
         bool qd = tnet_ringqueue_queue(&host->receiveBuffer, &buf, sizeof(buf)-TNET_MAX_PACKET_SIZE+buf.size);
         assert(qd);
-        pthread_mutex_unlock(&host->receiveBufMutex);
 
-        tnet_queue_data(host, connectionId, 0, 0, false, TNET_SEND_DATA_FLAG_DECLINE);
+        tnet_queue_data_int(host, connectionId, 0, 0, false, TNET_SEND_DATA_FLAG_DECLINE);
     }
 }
 
 void tnet_disconnect(tnet_host* host, tnet_u32 connectionId) // API version
 {
-    pthread_mutex_lock(&host->conStates[connectionId].conMutex);
+    pthread_mutex_lock(&host->mutex);
     disconnectConnection(host, connectionId);
-    pthread_mutex_unlock(&host->conStates[connectionId].conMutex);
+    pthread_mutex_unlock(&host->mutex);
 }
 
 void checkConnectionStates(tnet_host* host)
@@ -612,7 +561,6 @@ void checkConnectionStates(tnet_host* host)
     tnet_connection_state* connections = host->conStates;
     for(tnet_u32 i = 0; i < host->maxConnections; i++)
     {
-        pthread_mutex_lock(&connections[i].conMutex);
         if(connections[i].state != tnet_connection_state_t::CEDisconnected)
         {
             if(getDurationToNowMs(connections[i].lastPacketReceived) > TNET_CONNECTION_TIMEOUT_MS)
@@ -621,7 +569,6 @@ void checkConnectionStates(tnet_host* host)
                 printf("Disconnected\n");
             }
         }
-        pthread_mutex_unlock(&connections[i].conMutex);
     }
 }
 
@@ -629,9 +576,15 @@ unsigned short tnet_get_ping(tnet_host* host, unsigned int connectionId)
 {
     // TODO: is this safe (another thread could be modifying the ping, but do we reallt care?)
     // TODO: what if connectionId is invalid
-    return (unsigned short)host->conStates[connectionId].ping;
+    pthread_mutex_lock(&host->mutex);
+    unsigned short ret = (unsigned short)host->conStates[connectionId].ping;
+    pthread_mutex_unlock(&host->mutex);
+    return ret;
 }
 
+void queue_pingback_message(tnet_host* host, tnet_u32 connection, tnet_u16 latency);
+
+void queue_ping_message(tnet_host* host, tnet_u32 connection);
 void sendPackets(tnet_host* host)
 {
     tnet_time_point now;
@@ -653,18 +606,14 @@ void sendPackets(tnet_host* host)
     tnet_packet p;
 
     tnet_connection_state* connections = host->conStates;
-    pthread_mutex_lock(&host->sendBufMutex);
     // TODO: what happens if buf too small?
     // TODO: can invalid connectionid get here?
     while(tnet_ringqueue_dequeue(&host->sendBuffer, &q, sizeof(q)) > 0)
     {
-        pthread_mutex_lock(&connections[q.connection].conMutex);
         sendPacket(host, p, q, connections[q.connection].messageId, now);
         if(q.reliable)
             connections[q.connection].messageId++;
-        pthread_mutex_unlock(&connections[q.connection].conMutex);
     }
-    pthread_mutex_unlock(&host->sendBufMutex);
     // check if everything needs resend
     tnet_sent_reliable_data rdata;
     bool got = tnet_ringqueue_peek(&host->resendBuffer, &rdata, sizeof(rdata));
@@ -694,7 +643,7 @@ void sendPackets(tnet_host* host)
                 continue;
             else if(getDurationMs(host->conStates[i].lastPacketSent, now) >= TNET_CONNECTION_TIMEOUT_MS/2)
             {
-                tnet_queue_data(host, i, 0, 0, false, TNET_SEND_DATA_FLAG_HEARTBEAT);
+                tnet_queue_data_int(host, i, 0, 0, false, TNET_SEND_DATA_FLAG_HEARTBEAT);
             }
         }
     }
@@ -715,14 +664,12 @@ void receivePacket(tnet_host* host, tnet_u32 connectionId, tnet_connection_state
             printf("Corrupted packet 2\n");
             return;
         }
-        pthread_mutex_lock(&connection.conMutex); // <------------ CONNECTION MUTEX LOCK
         net_get_time(connection.lastPacketReceived);
 
         connection.packetsSinceAck++;
         if(connection.packetsSinceAck >= 25) // REMCONST
         {
-            tnet_queue_data(host, connectionId, 0, 0, true, TNET_SEND_DATA_FLAG_HEARTBEAT);
-            printf("Heartbeat\n");
+            tnet_queue_data_int(host, connectionId, 0, 0, true, TNET_SEND_DATA_FLAG_HEARTBEAT);
         }
 
         tnet_u16 messageId = p.relBody.messageId;
@@ -732,7 +679,7 @@ void receivePacket(tnet_host* host, tnet_u32 connectionId, tnet_connection_state
         {
             // TODO: replace assert with a useful measure (dc?)
             tnet_i32 cur = connection.receivedMessages[messageId%TNET_RECEIVED_MESSAGE_HISTORY_SIZE];
-            assert(cur == 0xFFFF || cur == (tnet_u16)(messageId-TNET_RECEIVED_MESSAGE_HISTORY_SIZE)); // if this fails, it means that either a reliable data was dropped or receivedMessages array overflowed
+            assert(cur == 0xFFFF || cur == (tnet_u16)(messageId-(tnet_u16)TNET_RECEIVED_MESSAGE_HISTORY_SIZE)); // if this fails, it means that either a reliable data was dropped or receivedMessages array overflowed
             connection.receivedMessages[messageId%TNET_RECEIVED_MESSAGE_HISTORY_SIZE] = messageId;
         }
         shouldDrop = shouldDrop || (p.heartbeat == 1); // drop messages that are heartbeat
@@ -740,7 +687,6 @@ void receivePacket(tnet_host* host, tnet_u32 connectionId, tnet_connection_state
         proccessRemoteAck(connection, p.relBody.ack, p.relBody.ackBits);
         // acknowledge the packet we received
         ackPacket(connection, p.relBody.seqId);
-        pthread_mutex_unlock(&connection.conMutex);  // <------------ CONNECTION MUTEX UNLOCK
         if(!shouldDrop) // only receive if not received before
         {
             // TODO: check buffer overflow?
@@ -782,27 +728,22 @@ void proccessPing(tnet_host* host, tnet_u32 connection, unsigned char* data)
         queue_pingback_message(host,connection,*((tnet_u16*)&data[1]));
         break;
     case TNET_PING_TYPE_PINGBACK: // response to our (we assume latest) ping request
-        pthread_mutex_lock(&host->conStates[connection].conMutex);
         latency = *((tnet_u16*)&data[1]);
         tnet_time_point now;
         net_get_time(now);
         host->conStates[connection].ping = getDurationMs(host->conStates[connection].lastPingRequest,now)-latency;
-        pthread_mutex_unlock(&host->conStates[connection].conMutex);
         break;
     default:
         assert(false); // this should only happen with corrupt packets
         break;
     }
 }
-void* receiveProc(void* context)
+void receiveProc(tnet_host* host)
 {
-    receiveProcArgs* args = (receiveProcArgs*)context;
-    tnet_i32 socket = args->host->socket;
-    tnet_connection_state* connections = args->host->conStates;
-    tnet_u32 maxConnections = args->host->maxConnections;
-    tnet_ringqueue* receiveBuf = &args->host->receiveBuffer;
-    tnet_host* host = args->host;
-    free(context);
+    tnet_i32 socket = host->socket;
+    tnet_connection_state* connections = host->conStates;
+    tnet_u32 maxConnections = host->maxConnections;
+    tnet_ringqueue* receiveBuf = &host->receiveBuffer;
     tnet_packet buf;
     tnet_i32 received;
     tnet_u32 fromAddr;
@@ -814,15 +755,11 @@ void* receiveProc(void* context)
         if(conId != -1) // connection exists and active
         {
             // TODO: locking and unlocking 2 times in  a row
-            pthread_mutex_lock(&connections[conId].conMutex);
             tnet_connection_state_t cstate = host->conStates[conId].state;
-            pthread_mutex_unlock(&connections[conId].conMutex);
 
             if((cstate == CEConnected || cstate == CEConnecting) && buf.decline) // disconnect signal
             {
-                pthread_mutex_lock(&connections[conId].conMutex);
                 disconnectConnection(host, conId);
-                pthread_mutex_unlock(&connections[conId].conMutex);
             }
             // TODO: wat is this shit
             else if(cstate == tnet_connection_state_t::CEConnected
@@ -832,13 +769,7 @@ void* receiveProc(void* context)
                     && !buf.heartbeat
                     && !buf.ping) // regular data
             {
-                pthread_mutex_lock(&host->receiveBufMutex);
-                if(buf.relBody.size != 86 && buf.relBody.size != 4)
-                {
-                    printf("what");
-                }
                 receivePacket(host, conId, connections[conId],buf, received, receiveBuf, tnet_host_event_t::HEData);
-                pthread_mutex_unlock(&host->receiveBufMutex);
             }
             // TODO: macro for packet size for reliable ping message
             else if(cstate == tnet_connection_state_t::CEConnected && buf.size-UREL_HEADER_SIZE == TNET_PING_MESSSAGE_SIZE) // ping packet
@@ -847,13 +778,8 @@ void* receiveProc(void* context)
             }
             else if(cstate == tnet_connection_state_t::CEConnecting && buf.acceptCon)
             {
-                pthread_mutex_lock(&connections[conId].conMutex);
                 connections[conId].state = tnet_connection_state_t::CEConnected;
-                pthread_mutex_unlock(&connections[conId].conMutex);
-
-                pthread_mutex_lock(&host->receiveBufMutex);
                 receivePacket(host, conId, connections[conId],buf, received, receiveBuf, tnet_host_event_t::HEConnect);
-                pthread_mutex_unlock(&host->receiveBufMutex);
             }
         }
         else if(buf.reqCon) // inactive or didn't exist
@@ -861,15 +787,11 @@ void* receiveProc(void* context)
             tnet_i32 newConId = findAndResetInactiveConnectionSlot(connections, maxConnections);
             if(newConId != -1)
             {
-                pthread_mutex_lock(&connections[newConId].conMutex);
                 connections[newConId].state = tnet_connection_state_t::CEConnecting;
                 connections[newConId].destIP = fromAddr;
                 connections[newConId].destPort = fromPort;
-                pthread_mutex_unlock(&connections[newConId].conMutex);
 
-                pthread_mutex_lock(&host->receiveBufMutex);
                 receivePacket(host, newConId, connections[newConId],buf, received, receiveBuf, tnet_host_event_t::HEConnect);
-                pthread_mutex_unlock(&host->receiveBufMutex);
             }
             else
             {
@@ -881,8 +803,6 @@ void* receiveProc(void* context)
             printf("weird packet? \n");
         }
     }
-    printf("Receive worker closed!\n");
-    return 0;
 }
 
 struct sendProcArgs
@@ -896,18 +816,20 @@ void* sendProc(void* context)
     sendProcArgs* args = (sendProcArgs*)context;
     tnet_host* host = args->host;
     free(context);
-    pthread_mutex_lock (&host->sendMut);
     while(true)                      //if while loop with signal complete first don't wait
     {
-        while(host->sendDone)
+        /*while(host->sendDone)
         {
             pthread_cond_wait(&host->sendCon, &host->sendMut);
-        }
+        }*/
+        pthread_mutex_lock (&host->mutex);
+        receiveProc(host);
         checkConnectionStates(host);
         sendPackets(host);
         host->sendDone = true;
+        pthread_mutex_unlock(&host->mutex);
+        usleep(1000);
     }
-    pthread_mutex_unlock (&host->sendMut);
     printf("Send worker closed!\n");
     return 0;
 }
@@ -939,32 +861,23 @@ bool tnet_create_host(tnet_host* host, tnet_u16 port, tnet_i32 maxConnections)
         tnet_free_host(host);
         return false; // memory allocation failed
     }
-    if(!tnet_ringqueue_initialize(&host->sendBuffer, tnet_Megabytes(1)))
+    if(!tnet_ringqueue_initialize(&host->sendBuffer, tnet_Megabytes(10)))
     {
         tnet_free_host(host);
         return false; // memory allocation failed
     }
-    if(!tnet_ringqueue_initialize(&host->receiveBuffer, tnet_Megabytes(1)))
+    if(!tnet_ringqueue_initialize(&host->receiveBuffer, tnet_Megabytes(10)))
     {
         tnet_free_host(host);
         return false; // memory allocation failed
     }
     host->sendDone = true;
-    host->sendMut=PTHREAD_MUTEX_INITIALIZER;
+    host->mutex=PTHREAD_MUTEX_INITIALIZER;
     host->sendCon=PTHREAD_COND_INITIALIZER;
-    host->sendBufMutex=PTHREAD_MUTEX_INITIALIZER;
-    host->receiveBufMutex=PTHREAD_MUTEX_INITIALIZER;
-    receiveProcArgs* wargs = new receiveProcArgs;
-    wargs->host = host;
-    if(pthread_create(&host->recWorker, 0, receiveProc, wargs))
-    {
-        printf("Creating worker thread for host failed!\n");
-        tnet_free_host(host);
-        return false;
-    }
+
     sendProcArgs* swargs = new sendProcArgs;
     swargs->host = host;
-    if(pthread_create(&host->sendWorker, 0, sendProc, swargs))
+    if(pthread_create(&host->netThread, 0, sendProc, swargs))
     {
         printf("Creating worker thread for host failed!\n");
         tnet_free_host(host);
@@ -976,16 +889,14 @@ bool tnet_create_host(tnet_host* host, tnet_u16 port, tnet_i32 maxConnections)
 void tnet_free_host(tnet_host* host)
 {
     // TODO: end thread in a better way
-    int canc = pthread_cancel(host->sendWorker);
-    canc = pthread_cancel(host->recWorker);
+    int canc = pthread_cancel(host->netThread);
     if(canc != 0)
     {
         printf("Canceling one of the threads failed!\n");
     }
 
     void *res;
-    pthread_join(host->sendWorker,&res);
-    pthread_join(host->recWorker,&res);
+    pthread_join(host->netThread,&res);
 
     //host->recWorker.join
     closeSocket(host->socket);
@@ -999,12 +910,12 @@ void tnet_free_host(tnet_host* host)
 
 tnet_host_event_t tnet_get_next_event(tnet_host* host, tnet_i32& connection, char* data, tnet_u32 size, tnet_i32& recSize)
 {
+    pthread_mutex_lock(&host->mutex);
     // TODO: 2 memcpys, remove 1
     // TODO: sure that no buffer overflow can happen?
+    tnet_host_event_t ret;
     tnet_received_event event;
-    pthread_mutex_lock(&host->receiveBufMutex);
     size_t result = tnet_ringqueue_dequeue(&host->receiveBuffer, &event, sizeof(event));
-    pthread_mutex_unlock(&host->receiveBufMutex);
     if(result > 0)
     {
         connection = event.connection;
@@ -1013,27 +924,35 @@ tnet_host_event_t tnet_get_next_event(tnet_host* host, tnet_i32& connection, cha
             memcpy(data, event.data, event.size);
             recSize = event.size;
         }
-        return event.type;
+        ret = event.type;
     }
     else
     {
-        return tnet_host_event_t::HENothing;
+        ret = HENothing;
     }
+    pthread_mutex_unlock(&host->mutex);
+    return ret;
 }
 
+// TODO: reimplement?
 void tnet_release_pending_data(tnet_host* host)
 {
-    pthread_mutex_lock (&host->sendMut);
     /*if(!host->sendDone)
         printf("main thread next iteration, but send thread not even started!\n");*/
     host->sendDone = false;
     //printf("signaling send worker\n");
     pthread_cond_signal(&host->sendCon);
-    pthread_mutex_unlock (&host->sendMut);
     //pthread_yield(); // just in case
 }
 
 void tnet_queue_data(tnet_host* host, tnet_i32 connection, const char* data, const tnet_i32 dataSize, const bool reliable, tnet_u32 flags)
+{
+    pthread_mutex_lock(&host->mutex);
+    tnet_queue_data_int(host, connection, data, dataSize, reliable, flags);
+    pthread_mutex_unlock(&host->mutex);
+}
+
+void tnet_queue_data_int(tnet_host* host, tnet_i32 connection, const char* data, const tnet_i32 dataSize, const bool reliable, tnet_u32 flags)
 {
     // TODO: basically 2 memcpys, remove 1
     tnet_queued_data buf;
@@ -1044,10 +963,61 @@ void tnet_queue_data(tnet_host* host, tnet_i32 connection, const char* data, con
     net_get_time(buf.queuedAt);
     memcpy(buf.data, data, dataSize);
 
-    pthread_mutex_lock(&host->sendBufMutex);
     bool qd = tnet_ringqueue_queue(&host->sendBuffer, (char*)&buf, sizeof(tnet_queued_data)+dataSize-TNET_MAX_PACKET_SIZE);
     assert(qd);
-    pthread_mutex_unlock(&host->sendBufMutex);
+}
+
+void queue_ping_message(tnet_host* host, tnet_u32 connection)
+{
+    char data[3]; // bytes 1 and 2 will be added when sending (latency in ms between queueing and actual sending)
+    data[0] = TNET_PING_TYPE_PING;
+    tnet_queue_data_int(host, connection, data, TNET_PING_MESSSAGE_SIZE, TNET_PING_IS_RELIABLE, TNET_SEND_DATA_FLAG_PING);
+}
+
+void queue_pingback_message(tnet_host* host, tnet_u32 connection, tnet_u16 latency)
+{
+    char data[3]; // bytes 1 and 2 will be added when sending (latency in ms between queueing and actual sending)
+    data[0] = TNET_PING_TYPE_PINGBACK;
+    *((tnet_u16*)&data[1]) = latency;
+    tnet_queue_data_int(host, connection, data, TNET_PING_MESSSAGE_SIZE, TNET_PING_IS_RELIABLE, TNET_SEND_DATA_FLAG_PING);
+}
+
+// TODO: accept strings
+tnet_i32 tnet_connect(tnet_host* host, tnet_u32 destIp, tnet_u16 destPort)
+{
+    pthread_mutex_lock(&host->mutex);
+    tnet_i32 conId = findAndResetInactiveConnectionSlot(host->conStates, host->maxConnections);
+    if(conId >= 0)
+    {
+        host->conStates[conId].destIP = destIp;
+        host->conStates[conId].destPort = destPort;
+        host->conStates[conId].state = tnet_connection_state_t::CEConnecting;
+        tnet_queue_data_int(host, conId, (char*)0, 0, true, TNET_SEND_DATA_FLAG_REQCON);
+    }
+    else
+    {
+        printf("Tried to start new connection when out of slots!\n");
+    }
+    pthread_mutex_unlock(&host->mutex);
+    return conId;
+}
+
+tnet_i32 tnet_accept(tnet_host* host, tnet_i32 conId)
+{
+    pthread_mutex_lock(&host->mutex);
+    if(conId >= 0)
+    {
+        // TODO: ??
+        host->conStates[conId].state = tnet_connection_state_t::CEConnected;
+        pthread_mutex_unlock(&host->mutex);
+        tnet_queue_data_int(host, conId, (char*)0, 0, true, TNET_SEND_DATA_FLAG_ACCCON);
+    }
+    else
+    {
+        printf("Tried to accept invalid connection!\n");
+    }
+    pthread_mutex_unlock(&host->mutex);
+    return conId;
 }
 
 bool tnet_ringqueue_initialize(tnet_ringqueue* dq, size_t size)
@@ -1239,5 +1209,5 @@ bool tnet_ringqueue_drop(tnet_ringqueue* dq)
     dq->state = tnet_ringqueue_state_t::Empty;
     return cursize > 0;
 }
-//#endif // TNET_IMPLEMENTATION
+#endif // TNET_IMPLEMENTATION
 #endif // TNET_H
