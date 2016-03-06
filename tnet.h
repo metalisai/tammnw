@@ -5,9 +5,12 @@
 #include <stdlib.h>
 #include <stdio.h>
 
-#define TNET_PLATFORM_LINUX
+#define TNET_PLATFORM_WINDOWS           0
+#define TNET_PLATFORM_LINUX		0
 
-//linux
+#ifdef __unix__ // <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<< LINUX HEADERS
+#undef TNET_PLATFORM_LINUX
+#define TNET_PLATFORM_LINUX	1
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <fcntl.h>
@@ -16,9 +19,12 @@
 #include <pthread.h>
 #include <errno.h>
 #include <unistd.h>
+#elif defined(_WIN32) || defined(WIN32) // <<<<<<<<<<<<<<< WINDOWS HEADERS
+#define TNET_PLATFORM_WINDOWS	1
+#include <WinSock2.h>
+#endif
 //TODO: remove
 #include <assert.h>
-
 #include <cstdint>
 
 #define TNET_SIMULATE_PACKETLOSS   0 // 1 = 33% packetloss
@@ -52,6 +58,8 @@ typedef uint16_t tnet_u16;
 #define TNET_PING_MESSSAGE_SIZE 3
 #define TNET_PING_IS_RELIABLE   0
 
+#define TNET_WORKER_STACK_SIZE	512000 // windows only
+
 enum tnet_connection_state_t
 {
     CEDisconnected,
@@ -77,10 +85,17 @@ struct tnet_ringqueue
     tnet_ringqueue_state_t state = tnet_ringqueue_state_t::Empty;
 };
 
-#ifdef TNET_PLATFORM_LINUX
+#if TNET_PLATFORM_LINUX
 typedef timespec tnet_time_point;
+typedef pthread_t tnet_thread;
+typedef pthread_mutex_t	tnet_mutex;
+#elif TNET_PLATFORM_WINDOWS
+	typedef	int tnet_time_point;
+	typedef HANDLE tnet_thread;
+	// TODO: is critical section fine for this?
+	typedef CRITICAL_SECTION tnet_mutex;
 #else
-    #error tnet_time_point not defined on this platform!
+#error tnet_time_point not defined for this platform
 #endif
 
 struct tnet_connection_state
@@ -124,10 +139,10 @@ struct tnet_host
     // send buffer
     // holds QueuedMessage structs
     tnet_ringqueue sendBuffer;
-    pthread_t netThread;
     volatile bool sendDone;
-    pthread_mutex_t mutex;
-    pthread_cond_t sendCon;
+    tnet_thread netThread;
+    tnet_mutex mutex;
+    //pthread_cond_t sendCon;
 
 };
 
@@ -197,12 +212,15 @@ struct tnet_relbody
 
 struct tnet_packet
 {
-    unsigned char hasRel : 1;
-    unsigned char reqCon : 1;
-    unsigned char acceptCon : 1;
-    unsigned char heartbeat : 1;
-    unsigned char decline : 1;
-    unsigned char ping : 1;
+	// if I use 8bit data type for 1 bit fields, 
+	// and 16bit data type for the 10 bit one, 
+	// then the microsoft compiler things the struct is 1 byte larger than it is for some reason
+    tnet_u16 hasRel : 1;
+    tnet_u16 reqCon : 1;
+    tnet_u16 acceptCon : 1;
+    tnet_u16 heartbeat : 1;
+    tnet_u16 decline : 1;
+    tnet_u16 ping : 1;
     tnet_u16 size : 10;
     union
     {
@@ -224,20 +242,26 @@ bool tnet_ringqueue_drop(tnet_ringqueue* dq);
 
 inline void net_get_time(tnet_time_point& to)
 {
-#ifdef TNET_PLATFORM_LINUX
+#if TNET_PLATFORM_LINUX
     clock_gettime(CLOCK_MONOTONIC, &to);
-#else
-#error "net_get_time not defined on this platform"
+#elif TNET_PLATFORM_WINDOWS
+	// TODO: only works for up to 49.7 days (https://msdn.microsoft.com/en-us/library/ms724408(VS.85).aspx)
+	// is that a problem?
+	to = GetTickCount();
+#else 
+#error net_get_time not defined for this platform
 #endif
 }
 
 inline tnet_i32 getDurationToNowMs(const tnet_time_point pastPoint)
 {
-#ifdef TNET_PLATFORM_LINUX
-    tnet_time_point now;
-    net_get_time(now);
+	tnet_time_point now;
+	net_get_time(now);
+#if TNET_PLATFORM_LINUX
     double dif = (now.tv_sec-pastPoint.tv_sec)*1000+(now.tv_nsec-pastPoint.tv_nsec)/1000000;
     return (tnet_i32)dif;
+#elif TNET_PLATFORM_WINDOWS
+	return now - pastPoint;
 #else
 #error getDurationToNowMs not defined
 #endif
@@ -245,11 +269,92 @@ inline tnet_i32 getDurationToNowMs(const tnet_time_point pastPoint)
 
 inline tnet_i32 getDurationMs(const tnet_time_point from, const tnet_time_point to)
 {
-#ifdef TNET_PLATFORM_LINUX
+#if TNET_PLATFORM_LINUX
     double dif = (to.tv_sec-from.tv_sec)*1000+(to.tv_nsec-from.tv_nsec)/1000000;
     return (tnet_i32)dif;
+#elif TNET_PLATFORM_WINDOWS
+	return to - from;
 #else
     #error getDuration not defined
+#endif
+}
+
+inline void tnet_sleep(int usec)
+{
+#if TNET_PLATFORM_LINUX
+        usleep(usec);
+#elif TNET_PLATFORM_WINDOWS
+	Sleep(usec / 1000);
+#else
+#error tnet_sleep not defined on this platform
+#endif
+}
+
+#if TNET_PLATFORM_LINUX
+typedef void*(*tnet_worker_func)(void*);
+#elif TNET_PLATFORM_WINDOWS
+typedef void(*tnet_worker_func)(void);
+#else
+#error tnet_worker_func not defined on this platform
+#endif
+
+inline bool tnet_create_thread(tnet_thread& thread, tnet_worker_func proc, void* args)
+{
+#if TNET_PLATFORM_LINUX
+        return pthread_create(&thread, 0, proc, args);
+#elif TNET_PLATFORM_WINDOWS
+	thread = CreateThread(0,TNET_WORKER_STACK_SIZE,(LPTHREAD_START_ROUTINE)proc,args,0,0);
+	return thread == 0;
+#else
+#error create_thread not implemented on this platform
+#endif
+}
+
+inline tnet_mutex tnet_create_mutex()
+{
+#if TNET_PLATFORM_LINUX
+	return PTHREAD_MUTEX_INITIALIZER;
+#elif TNET_PLATFORM_WINDOWS
+	//return CreateMutex(0,false,0);
+	CRITICAL_SECTION critSec;
+	InitializeCriticalSection(&critSec);
+	return critSec;
+#else
+#error tnet_create_mutex not implemented on this platform
+#endif
+}
+
+// TODO: stick this somewhere
+inline void tnet_destroy_mutex(tnet_mutex& mut)
+{
+#if TNET_PLATFORM_LINUX
+        mut = PTHREAD_MUTEX_INITIALIZER; // just to suppress the warning...
+#elif TNET_PLATFORM_WINDOWS
+	DeleteCriticalSection(&mut);
+#else
+#error tnet_create_mutex not implemented on this platform
+#endif
+}
+
+inline void tnet_lock_mutex(tnet_mutex* mut)
+{
+#if TNET_PLATFORM_LINUX
+	pthread_mutex_lock(mut);
+#elif TNET_PLATFORM_WINDOWS
+	EnterCriticalSection(mut);
+#else
+#error tnet_lock_mutex not implemented on this platform
+#endif
+}
+
+inline void tnet_unlock_mutex(tnet_mutex* mut)
+{
+#if TNET_PLATFORM_LINUX
+	pthread_mutex_unlock(mut);
+#elif TNET_PLATFORM_WINDOWS
+	LeaveCriticalSection(mut);
+#else
+#error tnet_lock_mutex not implemented on this platform
 #endif
 }
 
@@ -257,13 +362,42 @@ void closeSocket(tnet_i32 socket)
 {
     if(socket != -1)
     {
+#if TNET_PLATFORM_LINUX
         close(socket);
         //shutdown(socket, SHUT_RDWR);
+#elif TNET_PLATFORM_WINDOWS
+		closesocket(socket);
+#else
+#error	Closing socket not defined on this platform!
+#endif
     }
     else
     {
         printf("trying to close an invalid socket!\n");
     }
+}
+
+inline void tnet_setNonBlocking(tnet_i32 socket, bool blocking)
+{
+#if  TNET_PLATFORM_LINUX
+	tnet_u32 flags = fcntl(socket, F_GETFL, 0);
+	if (blocking)
+		flags &= ~O_NONBLOCK;
+	else
+		flags |= O_NONBLOCK;
+        if (fcntl(socket, F_SETFL, flags) == -1)
+	{
+		printf("Failed to set socket blocking mode!\n");
+		closeSocket(socket);
+	}
+#elif TNET_PLATFORM_WINDOWS
+	u_long iMode = blocking ? 0 : 1; // nonzero = nonblocking, in other words zero = blocking
+	tnet_i32 iResult = ioctlsocket(socket, FIONBIO, &iMode);
+	if (iResult != NO_ERROR)
+		printf("ioctlsocket failed with error: %ld\n", iResult);
+#else
+#error setNonBlocking not implemented on this platform
+#endif
 }
 
 tnet_i32 openSocket(tnet_u16 port)
@@ -285,19 +419,7 @@ tnet_i32 openSocket(tnet_u16 port)
         printf("Binding socket failed!\n");
         return -1;
     }
-    // set blocking mode
-    tnet_u32 blocking = 0;
-    tnet_u32 flags = fcntl(nsock, F_GETFL, 0);
-    if (blocking)
-        flags &= ~O_NONBLOCK;
-    else
-        flags |= O_NONBLOCK;
-    if (fcntl(nsock, F_SETFL, flags) == -1)
-    {
-        printf("Failed to set socket blocking mode!\n");
-        closeSocket(nsock);
-        return -1;
-    }
+	tnet_setNonBlocking(nsock,false);
     return nsock;
 }
 
@@ -312,9 +434,9 @@ tnet_i32 sendToSocket(tnet_i32 socket, void* data, tnet_u16 size, tnet_u32 destI
 #if TNET_SIMULATE_PACKETLOSS
     if(random() % 3 != 1)
 #endif
-        sentBytes = sendto(socket, data, size, 0, (sockaddr*)&address, sizeof(sockaddr_in));
+        sentBytes = sendto(socket, (const char*)data, size, 0, (sockaddr*)&address, sizeof(sockaddr_in));
 #if TNET_SIMULATE_REPEAT
-        sentBytes = sendto(socket, data, size, 0, (sockaddr*)&address, sizeof(sockaddr_in));
+        sentBytes = sendto(socket, (const char*)data, size, 0, (sockaddr*)&address, sizeof(sockaddr_in));
 #endif
     if(sentBytes <= 0)
     {
@@ -327,13 +449,16 @@ bool recvFromSocket(tnet_i32 socket, char* data, tnet_i32& received, tnet_u32& f
 {
     bool ret;
     sockaddr_in from;
+#if TNET_PLATFORM_WINDOWS
+	typedef int socklen_t;
+#endif
     socklen_t fromLength = sizeof(from);
     tnet_i32 ss;
     ss = recvfrom(socket, (char*)data, TNET_MAX_PACKET_SIZE, 0, (sockaddr*)&from, &fromLength);
-    if(ss == -1 && errno != 11)
+    /*if(ss == -1 && errno != 11) // TODO: if you want to keep this, it doesn't work on windows currently
     {
         printf("recvfrom failed errno:%d\n",errno);
-    }
+    }*/
     ret = ss > 0;
     if (ret)
     {
@@ -524,7 +649,6 @@ void sendPacket(tnet_host* host, tnet_packet& p, tnet_queued_data& q, tnet_u16 m
         bool qd = tnet_ringqueue_queue(&host->resendBuffer, &rdata, sizeof(tnet_sent_reliable_data)-TNET_MAX_PACKET_SIZE+q.size);
         assert(qd);
     }
-
     // TODO: is the size correct?
     sendToSocket(host->socket, &p, p.size, connections[q.connection].destIP, connections[q.connection].destPort);
 }
@@ -551,9 +675,9 @@ void disconnectConnection(tnet_host* host, tnet_u32 connectionId)  // internal v
 
 void tnet_disconnect(tnet_host* host, tnet_u32 connectionId) // API version
 {
-    pthread_mutex_lock(&host->mutex);
+    tnet_lock_mutex(&host->mutex);
     disconnectConnection(host, connectionId);
-    pthread_mutex_unlock(&host->mutex);
+    tnet_unlock_mutex(&host->mutex);
 }
 
 void checkConnectionStates(tnet_host* host)
@@ -576,9 +700,9 @@ unsigned short tnet_get_ping(tnet_host* host, unsigned int connectionId)
 {
     // TODO: is this safe (another thread could be modifying the ping, but do we reallt care?)
     // TODO: what if connectionId is invalid
-    pthread_mutex_lock(&host->mutex);
+	tnet_lock_mutex(&host->mutex);
     unsigned short ret = (unsigned short)host->conStates[connectionId].ping;
-    pthread_mutex_unlock(&host->mutex);
+	tnet_unlock_mutex(&host->mutex);
     return ret;
 }
 
@@ -822,13 +946,13 @@ void* sendProc(void* context)
         {
             pthread_cond_wait(&host->sendCon, &host->sendMut);
         }*/
-        pthread_mutex_lock (&host->mutex);
+		tnet_lock_mutex(&host->mutex);
         receiveProc(host);
         checkConnectionStates(host);
         sendPackets(host);
         host->sendDone = true;
-        pthread_mutex_unlock(&host->mutex);
-        usleep(1000);
+		tnet_unlock_mutex(&host->mutex);
+        tnet_sleep(1000);
     }
     printf("Send worker closed!\n");
     return 0;
@@ -836,6 +960,18 @@ void* sendProc(void* context)
 
 bool tnet_create_host(tnet_host* host, tnet_u16 port, tnet_i32 maxConnections)
 {
+
+#if TNET_PLATFORM_WINDOWS
+	int iResult;
+	WSADATA wsaData;
+	// Initialize Winsock
+	iResult = WSAStartup(MAKEWORD(2, 2), &wsaData);
+	if (iResult != 0) {
+		printf("WSAStartup failed: %d\n", iResult);
+		return 1;
+	}
+#endif
+
     host->maxConnections = maxConnections;
     // TODO: add to settings
     host->keepConnectionsAlive = true;
@@ -872,12 +1008,13 @@ bool tnet_create_host(tnet_host* host, tnet_u16 port, tnet_i32 maxConnections)
         return false; // memory allocation failed
     }
     host->sendDone = true;
-    host->mutex=PTHREAD_MUTEX_INITIALIZER;
-    host->sendCon=PTHREAD_COND_INITIALIZER;
+    host->mutex = tnet_create_mutex();
+    //host->sendCon=PTHREAD_COND_INITIALIZER;
 
     sendProcArgs* swargs = new sendProcArgs;
     swargs->host = host;
-    if(pthread_create(&host->netThread, 0, sendProc, swargs))
+    //if(pthread_create(&host->netThread, 0, sendProc, swargs))
+	if(tnet_create_thread(host->netThread, (tnet_worker_func)sendProc,swargs))
     {
         printf("Creating worker thread for host failed!\n");
         tnet_free_host(host);
@@ -889,6 +1026,8 @@ bool tnet_create_host(tnet_host* host, tnet_u16 port, tnet_i32 maxConnections)
 void tnet_free_host(tnet_host* host)
 {
     // TODO: end thread in a better way
+    // TODO: thread not ending on windows yet?
+#if TNET_PLATFORM_LINUX
     int canc = pthread_cancel(host->netThread);
     if(canc != 0)
     {
@@ -897,7 +1036,8 @@ void tnet_free_host(tnet_host* host)
 
     void *res;
     pthread_join(host->netThread,&res);
-
+#endif
+    tnet_destroy_mutex(host->mutex);
     //host->recWorker.join
     closeSocket(host->socket);
     free(host->conStates);
@@ -910,7 +1050,7 @@ void tnet_free_host(tnet_host* host)
 
 tnet_host_event_t tnet_get_next_event(tnet_host* host, tnet_i32& connection, char* data, tnet_u32 size, tnet_i32& recSize)
 {
-    pthread_mutex_lock(&host->mutex);
+    tnet_lock_mutex(&host->mutex);
     // TODO: 2 memcpys, remove 1
     // TODO: sure that no buffer overflow can happen?
     tnet_host_event_t ret;
@@ -930,7 +1070,7 @@ tnet_host_event_t tnet_get_next_event(tnet_host* host, tnet_i32& connection, cha
     {
         ret = HENothing;
     }
-    pthread_mutex_unlock(&host->mutex);
+    tnet_unlock_mutex(&host->mutex);
     return ret;
 }
 
@@ -941,15 +1081,15 @@ void tnet_release_pending_data(tnet_host* host)
         printf("main thread next iteration, but send thread not even started!\n");*/
     host->sendDone = false;
     //printf("signaling send worker\n");
-    pthread_cond_signal(&host->sendCon);
+    //pthread_cond_signal(&host->sendCon);
     //pthread_yield(); // just in case
 }
 
 void tnet_queue_data(tnet_host* host, tnet_i32 connection, const char* data, const tnet_i32 dataSize, const bool reliable, tnet_u32 flags)
 {
-    pthread_mutex_lock(&host->mutex);
+    tnet_lock_mutex(&host->mutex);
     tnet_queue_data_int(host, connection, data, dataSize, reliable, flags);
-    pthread_mutex_unlock(&host->mutex);
+    tnet_unlock_mutex(&host->mutex);
 }
 
 void tnet_queue_data_int(tnet_host* host, tnet_i32 connection, const char* data, const tnet_i32 dataSize, const bool reliable, tnet_u32 flags)
@@ -985,7 +1125,7 @@ void queue_pingback_message(tnet_host* host, tnet_u32 connection, tnet_u16 laten
 // TODO: accept strings
 tnet_i32 tnet_connect(tnet_host* host, tnet_u32 destIp, tnet_u16 destPort)
 {
-    pthread_mutex_lock(&host->mutex);
+    tnet_lock_mutex(&host->mutex);
     tnet_i32 conId = findAndResetInactiveConnectionSlot(host->conStates, host->maxConnections);
     if(conId >= 0)
     {
@@ -998,25 +1138,24 @@ tnet_i32 tnet_connect(tnet_host* host, tnet_u32 destIp, tnet_u16 destPort)
     {
         printf("Tried to start new connection when out of slots!\n");
     }
-    pthread_mutex_unlock(&host->mutex);
+    tnet_unlock_mutex(&host->mutex);
     return conId;
 }
 
 tnet_i32 tnet_accept(tnet_host* host, tnet_i32 conId)
 {
-    pthread_mutex_lock(&host->mutex);
+    tnet_lock_mutex(&host->mutex);
     if(conId >= 0)
     {
         // TODO: ??
         host->conStates[conId].state = tnet_connection_state_t::CEConnected;
-        pthread_mutex_unlock(&host->mutex);
         tnet_queue_data_int(host, conId, (char*)0, 0, true, TNET_SEND_DATA_FLAG_ACCCON);
     }
     else
     {
         printf("Tried to accept invalid connection!\n");
     }
-    pthread_mutex_unlock(&host->mutex);
+    tnet_unlock_mutex(&host->mutex);
     return conId;
 }
 

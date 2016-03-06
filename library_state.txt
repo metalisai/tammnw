@@ -6,13 +6,12 @@ TODO:
 	Optional automatic buffer resize in case of overflow
 	Data limits (some protection against flooding)
 	Getting rid of unneccesary memcpys / better memory layout
-	Better threading model
-	Windows support
 	Mac OSX support
 	Usage examples
 	Compability with C
 	If resend buffer is full, stop sending reliable messages
 	Reduce header sizes
+	Limit to how many times a message can be resent
 
 DONE:
 	Virtual connection
@@ -22,6 +21,8 @@ DONE:
 	Connection timeouts
 	Keeping connections alive
 	Disconnecting and declining
+	Linux support
+	Windows support
 
 DON'T KNOW IF I WANT:
 	File transmisson
